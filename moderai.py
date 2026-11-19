@@ -1,9 +1,19 @@
-"""AI-модерация чата через внешний Harmony API.
 
-Проверяет только сообщения, которые прошли локальный фильтр. Классификации
-"class=1" накапливаются в БД за последние 2 часа. На пороге пользователь
-получает автоматический мут на 24 часа, а в чат отправляется карточка для
-решения администратора.
+"""
+Ksenya AI Security — многоступенчатая AI-модерация Telegram.
+
+Возможности:
+- Расширенный локальный фильтр токсичности.
+- Обнаружение мата, оскорблений, угроз и травли.
+- Обнаружение транслита, цифр и обхода символами.
+- Обнаружение слов, разделённых пробелами.
+- Контекстные выражения.
+- Ограниченная очередь сообщений.
+- Не более 3 одновременных запросов Harmony.
+- Таймауты и защита от зависших запросов.
+- Сохранение нарушений в Turso.
+- 5 нарушений за 2 часа = мут на 24 часа.
+- Карточки администратору с кнопками.
 """
 
 import asyncio
@@ -13,52 +23,333 @@ import os
 import re
 import secrets
 import time
+import unicodedata
+
 from datetime import datetime, timedelta, timezone
 from typing import Any
 
 import aiohttp
-from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
+
+from telegram import (
+    Update,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    ChatPermissions,
+)
+
 from telegram.constants import ChatType, ParseMode
 from telegram.error import TelegramError
 from telegram.ext import ContextTypes
-from telegram import ChatPermissions
 
 import db
 
+
 logger = logging.getLogger("moderai")
 
+
+# ============================================================
+# CONFIGURATION
+# ============================================================
+
 API_URL = "https://tambovinside.onrender.com/check"
+
 API_TOKEN = os.getenv("AImoder", "").strip()
+
 ADMIN_ID = int(os.getenv("ADMIN_ID", "0") or 0)
 CHAT_ID = int(os.getenv("CHAT_ID", "0") or 0)
+
 ADMIN_MENTION = "@YouWarm"
 
-# Пять классификаций class=1 за последние два часа.
 VIOLATION_THRESHOLD = 5
+
 WINDOW_SECONDS = 2 * 60 * 60
 MUTE_SECONDS = 24 * 60 * 60
+
 REQUEST_TIMEOUT_SECONDS = 10
+
 MAX_PARALLEL_REQUESTS = 3
 
-# Лёгкий локальный фильтр: модель не вызывается для обычных сообщений.
-# Отдельные короткие оскорбления тоже проходят фильтр.
-_SUSPICIOUS_RE = re.compile(
-    r"(?iu)(?<![а-яё])(?:"
-    r"бля\w*|бляд\w*|сука|суки|сукой|сучк\w*|"
-    r"уеб\w*|уёб\w*|ебан\w*|ебл\w*|заеб\w*|"
-    r"пизд\w*|ху[йеяи]\w*|нахуй|нахуя|хуй\w*|"
-    r"мраз\w*|урод\w*|дебил\w*|идиот\w*|"
-    r"тупиц\w*|туп(?:ой|ая|ое|ые|ица|ица)\b|"
-    r"муд[ао]\w*|гандон\w*|чмо\b|шлюх\w*|"
-    r"коз[её]л\w*|ублюд\w*|говн\w*|сволоч\w*"
-    r")(?![а-яё])"
-)
+# Максимум сообщений, ожидающих обработки.
+MAX_QUEUE_SIZE = 100
+
+# Максимальная длина текста для Harmony.
+MAX_TEXT_LENGTH = 1000
+
+# Очередь не позволяет создавать бесконечное количество задач.
+_queue: asyncio.Queue | None = None
+
+_workers: set[asyncio.Task] = set()
 
 _session: aiohttp.ClientSession | None = None
+
 _request_semaphore = asyncio.Semaphore(MAX_PARALLEL_REQUESTS)
-_background_tasks: set[asyncio.Task] = set()
+
 _user_locks: dict[tuple[int, int], asyncio.Lock] = {}
 
+# Защита от повторного добавления одного сообщения.
+_queued_messages: set[tuple[int, int]] = set()
+
+
+# ============================================================
+# NORMALIZATION
+# ============================================================
+
+_TRANSLATION = str.maketrans({
+    "0": "о",
+    "1": "и",
+    "3": "з",
+    "4": "ч",
+    "5": "с",
+    "6": "б",
+    "8": "в",
+    "@": "а",
+    "$": "с",
+    "ё": "е",
+})
+
+
+def _normalize_for_filter(text: str) -> list[str]:
+    """
+    Возвращает несколько вариантов текста для поиска обходов фильтра.
+    """
+
+    if not text:
+        return []
+
+    text = unicodedata.normalize("NFKC", text).lower()
+
+    # Удаляем невидимые символы.
+    text = re.sub(r"[\u200b-\u200f\u202a-\u202e\ufeff]", "", text)
+
+    # Нормализация цифр и похожих символов.
+    normalized = text.translate(_TRANSLATION)
+
+    # Вариант без пробелов и разделителей между буквами.
+    compact = re.sub(
+        r"(?<=[a-zа-яё0-9])[\s._*+\-]+(?=[a-zа-яё0-9])",
+        "",
+        normalized,
+    )
+
+    # Вариант без разделителей вообще.
+    compact_all = re.sub(r"[\s._*+\-]+", "", normalized)
+
+    return [normalized, compact, compact_all]
+
+
+# ============================================================
+# LOCAL FILTER
+# ============================================================
+
+# Это предварительный фильтр, а не окончательный классификатор.
+# Совпадение означает только необходимость проверки Harmony.
+
+_SUSPICIOUS_RE = re.compile(
+    r"(?iu)("
+
+    # --------------------------------------------------------
+    # Русский мат
+    # --------------------------------------------------------
+
+    r"бля\w*|бляд\w*|блят\w*|"
+    r"сука|суки|сукой|суку|сучк\w*|"
+    r"еб\w*|ёб\w*|йоб\w*|"
+    r"пизд\w*|пезд\w*|"
+    r"ху[йеяиюи]\w*|хуй\w*|"
+    r"нахуй|нахуя|"
+    r"муд[ао]\w*|"
+    r"гандон\w*|"
+    r"залуп\w*|"
+    r"шлюх\w*|"
+    r"манда\w*|"
+    r"говн\w*|"
+    r"дерьм\w*|"
+    r"уеб\w*|уёб\w*|"
+    r"заеб\w*|заёб\w*|"
+    r"долбо[её]б\w*|"
+    r"выеб\w*|въеб\w*|"
+    r"оху\w*|"
+    r"хер\w*|"
+    r"ссан\w*|"
+    r"ссык\w*|"
+    r"еблан\w*|"
+    r"ебуч\w*|"
+    r"ебучк\w*|"
+    r"поху\w*|"
+    r"хуле\b|"
+    r"хули\b|"
+    r"бзд\w*|"
+
+    # --------------------------------------------------------
+    # Оскорбления
+    # --------------------------------------------------------
+
+    r"мраз\w*|"
+    r"урод\w*|"
+    r"дебил\w*|"
+    r"идиот\w*|"
+    r"туп\w*|"
+    r"кретин\w*|"
+    r"ничтож\w*|"
+    r"ублюд\w*|"
+    r"сволоч\w*|"
+    r"мерзав\w*|"
+    r"чмош\w*|"
+    r"чмо\b|"
+    r"коз[её]л\w*|"
+    r"лох\w*|"
+    r"лохуш\w*|"
+    r"гнид\w*|"
+    r"падл\w*|"
+    r"твар\w*|"
+    r"мудак\w*|"
+    r"петух\w*|"
+    r"свинь\w*|"
+    r"пидор\w*|"
+    r"пидар\w*|"
+    r"пидр\w*|"
+    r"пидорас\w*|"
+    r"ссыкло\w*|"
+    r"безмозгл\w*|"
+    r"бестолоч\w*|"
+    r"недоумок\w*|"
+    r"ничтожество\w*|"
+    r"позорищ\w*|"
+
+    # --------------------------------------------------------
+    # Угрозы и агрессия
+    # --------------------------------------------------------
+
+    r"убью|убить|убей|"
+    r"сдохни|сдохнет|"
+    r"зарежу|пристрелю|"
+    r"сломаю|изобью|"
+    r"уничтожу|"
+    r"ненавижу|"
+    r"заткнись|"
+    r"закрой\s+рот|"
+    r"пасть\s+закрой|"
+    r"отвали|"
+    r"вали\s+отсюда|"
+    r"пош[её]л\s+на|"
+    r"иди\s+нах|"
+    r"получишь\s+пизд|"
+    r"я\s+тебя\s+убью|"
+    r"тебе\s+конец|"
+    r"найду\s+тебя|"
+    r"разобью\s+тебе|"
+    r"перережу|"
+
+    # --------------------------------------------------------
+    # Сексуальная лексика
+    # --------------------------------------------------------
+
+    r"секс\w*|"
+    r"порно\w*|"
+    r"дроч\w*|"
+    r"минет\w*|"
+    r"куни\w*|"
+    r"трах\w*|"
+    r"конча\w*|"
+    r"сперм\w*|"
+    r"член\w*|"
+    r"вагин\w*|"
+    r"пенис\w*|"
+    r"нюдс\w*|"
+    r"голыш\w*|"
+    r"сос[иа]\w*|"
+
+    # --------------------------------------------------------
+    # Травля и унижение
+    # --------------------------------------------------------
+
+    r"никому\s+не\s+нужен|"
+    r"ты\s+никто|"
+    r"ты\s+ничтожество|"
+    r"тебя\s+ненавидят|"
+    r"всем\s+на\s+тебя\s+плевать|"
+    r"лучше\s+бы\s+тебя\s+не\s+было|"
+    r"ты\s+позор|"
+    r"ты\s+жалок|"
+    r"ты\s+жалкая|"
+    r"ты\s+мерзкий|"
+    r"ты\s+мерзкая|"
+    r"ты\s+отвратителен|"
+    r"ты\s+отвратительна|"
+    r"никто\s+тебя\s+не\s+любит|"
+    r"всем\s+на\s+тебя\s+плевать|"
+    r"лучше\s+исчезни|"
+    r"вали\s+из\s+чата|"
+    r"опущенн\w*|"
+
+    # --------------------------------------------------------
+    # Транслит
+    # --------------------------------------------------------
+
+    r"blya\w*|"
+    r"blyat\w*|"
+    r"suka\w*|"
+    r"pizd\w*|"
+    r"huy\w*|"
+    r"hui\w*|"
+    r"ebat\w*|"
+    r"mudak\w*|"
+    r"pidor\w*|"
+    r"nahuy\w*|"
+    r"zaeb\w*|"
+    r"yob\w*|"
+    r"hernya\w*|"
+    r"debil\w*|"
+    r"idiot\w*"
+
+    r")"
+)
+
+
+# Дополнительные контекстные признаки.
+_CONTEXT_RE = re.compile(
+    r"(?iu)("
+    r"ты\s+(?:туп|дебил|идиот|урод|мраз|чмо|"
+    r"ничтож|мудак|пидор|лох|свинь)|"
+    r"сам\s+(?:ты\s+)?(?:дебил|идиот|урод|мраз)|"
+    r"твоя\s+(?:мать|мамаша)|"
+    r"твою\s+мать|"
+    r"мать\s+твою|"
+    r"пош[её]л\s+ты|"
+    r"иди\s+ты\s+на|"
+    r"закрой\s+свой\s+рот|"
+    r"заткни\s+свою\s+пасть|"
+    r"сдохни\s+уже|"
+    r"ты\s+мне\s+противен|"
+    r"ты\s+мне\s+противна"
+    r")"
+)
+
+
+def _is_candidate(text: str) -> bool:
+    """
+    Быстрая локальная проверка.
+    Harmony вызывается только при наличии подозрительных признаков.
+    """
+
+    if not text:
+        return False
+
+    variants = _normalize_for_filter(text)
+
+    for variant in variants:
+        if _SUSPICIOUS_RE.search(variant):
+            return True
+
+        if _CONTEXT_RE.search(variant):
+            return True
+
+    return False
+
+
+# ============================================================
+# TELEGRAM PERMISSIONS
+# ============================================================
 
 def _permissions_muted() -> ChatPermissions:
     return ChatPermissions(
@@ -90,10 +381,19 @@ def _permissions_unmuted() -> ChatPermissions:
     )
 
 
+# ============================================================
+# DATABASE
+# ============================================================
+
 async def init_db() -> None:
-    """Создаёт таблицы модерации в той же Turso БД, что и основной бот."""
+    """
+    Создание таблиц и запуск очереди.
+    Вызывай при запуске бота.
+    """
+
     await db._exec_required(
-        """CREATE TABLE IF NOT EXISTS ai_moderation_violations (
+        """
+        CREATE TABLE IF NOT EXISTS ai_moderation_violations (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             chat_id INTEGER NOT NULL,
             user_id INTEGER NOT NULL,
@@ -102,14 +402,22 @@ async def init_db() -> None:
             toxic_score REAL,
             created_at INTEGER NOT NULL,
             UNIQUE(chat_id, message_id)
-        )"""
+        )
+        """
     )
+
     await db._exec_required(
-        """CREATE INDEX IF NOT EXISTS idx_ai_mod_user_window
-           ON ai_moderation_violations(chat_id, user_id, created_at)"""
+        """
+        CREATE INDEX IF NOT EXISTS idx_ai_mod_user_window
+        ON ai_moderation_violations(
+            chat_id, user_id, created_at
+        )
+        """
     )
+
     await db._exec_required(
-        """CREATE TABLE IF NOT EXISTS ai_moderation_alerts (
+        """
+        CREATE TABLE IF NOT EXISTS ai_moderation_alerts (
             alert_id TEXT PRIMARY KEY,
             chat_id INTEGER NOT NULL,
             user_id INTEGER NOT NULL,
@@ -118,86 +426,266 @@ async def init_db() -> None:
             auto_muted INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL,
             muted_until INTEGER
-        )"""
+        )
+        """
     )
+
     await db._exec_required(
-        """CREATE UNIQUE INDEX IF NOT EXISTS uq_ai_mod_pending_alert
-           ON ai_moderation_alerts(chat_id, user_id)
-           WHERE status = 'pending'"""
+        """
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_ai_mod_pending_alert
+        ON ai_moderation_alerts(chat_id, user_id)
+        WHERE status = 'pending'
+        """
     )
+
+    _start_workers()
+
     if not API_TOKEN:
-        logger.warning("AImoder не задан в Render Environment — AI-модерация выключена")
+        logger.warning(
+            "AImoder отсутствует в Render Environment. "
+            "AI-модерация выключена."
+        )
     else:
         logger.info(
-            "AI moderation initialized: chat_id=%s threshold=%s window=%ss",
-            CHAT_ID, VIOLATION_THRESHOLD, WINDOW_SECONDS,
+            "Ksenya AI Security initialized: "
+            "chat=%s threshold=%s window=%s workers=%s",
+            CHAT_ID,
+            VIOLATION_THRESHOLD,
+            WINDOW_SECONDS,
+            MAX_PARALLEL_REQUESTS,
         )
 
 
+# ============================================================
+# QUEUE
+# ============================================================
+
+def _start_workers() -> None:
+    global _queue
+
+    if _queue is None:
+        _queue = asyncio.Queue(maxsize=MAX_QUEUE_SIZE)
+
+    active_workers = sum(not task.done() for task in _workers)
+
+    for _ in range(MAX_PARALLEL_REQUESTS - active_workers):
+        task = asyncio.create_task(_worker_loop())
+        _workers.add(task)
+        task.add_done_callback(_workers.discard)
+
+
+async def _worker_loop() -> None:
+    while True:
+        item = await _queue.get()
+
+        try:
+            message, bot = item
+            await _process_message(message, bot)
+
+        except asyncio.CancelledError:
+            raise
+
+        except Exception:
+            logger.exception("Ошибка обработки сообщения AI-модерацией")
+
+        finally:
+            if item:
+                message, _ = item
+                _queued_messages.discard(
+                    (message.chat_id, message.message_id)
+                )
+
+            _queue.task_done()
+
+
+# ============================================================
+# HTTP SESSION
+# ============================================================
+
 async def _get_session() -> aiohttp.ClientSession:
     global _session
+
     if _session is None or _session.closed:
-        timeout = aiohttp.ClientTimeout(total=REQUEST_TIMEOUT_SECONDS, connect=4)
-        connector = aiohttp.TCPConnector(limit=MAX_PARALLEL_REQUESTS, ttl_dns_cache=300)
-        _session = aiohttp.ClientSession(timeout=timeout, connector=connector)
+        timeout = aiohttp.ClientTimeout(
+            total=REQUEST_TIMEOUT_SECONDS,
+            connect=4,
+        )
+
+        connector = aiohttp.TCPConnector(
+            limit=MAX_PARALLEL_REQUESTS,
+            ttl_dns_cache=300,
+            enable_cleanup_closed=True,
+        )
+
+        _session = aiohttp.ClientSession(
+            timeout=timeout,
+            connector=connector,
+        )
+
     return _session
 
 
 async def close() -> None:
+    """
+    Вызывать при завершении приложения.
+    """
+
     global _session
-    tasks = list(_background_tasks)
-    if tasks:
+
+    if _queue is not None:
         try:
             await asyncio.wait_for(
-                asyncio.gather(*tasks, return_exceptions=True), timeout=12
+                _queue.join(),
+                timeout=5,
             )
         except asyncio.TimeoutError:
-            for task in tasks:
-                task.cancel()
+            logger.warning(
+                "Очередь AI-модерации не успела полностью обработаться"
+            )
+
+    for task in list(_workers):
+        task.cancel()
+
+    if _workers:
+        await asyncio.gather(
+            *_workers,
+            return_exceptions=True,
+        )
+
+    _workers.clear()
+
     if _session and not _session.closed:
         await _session.close()
+
     _session = None
 
+    logger.info("AI moderation stopped")
 
-def _is_candidate(text: str) -> bool:
-    return bool(text and _SUSPICIOUS_RE.search(text))
+
+# ============================================================
+# HARMONY API
+# ============================================================
+
+def _parse_score(value: Any) -> float:
+    """
+    Поддерживает значения как 0.6639, так и 66.39.
+    Возвращает значение в диапазоне 0..1.
+    """
+
+    try:
+        score = float(value)
+    except (TypeError, ValueError):
+        return 0.0
+
+    if score > 1:
+        score /= 100
+
+    return max(0.0, min(score, 1.0))
 
 
 async def _classify(text: str) -> dict[str, Any] | None:
     if not API_TOKEN:
         return None
+
     session = await _get_session()
-    headers = {"X-API-Token": API_TOKEN}
-    # Сервер принимает максимум 1000 символов.
-    payload = {"text": text[:1000]}
+
+    headers = {
+        "X-API-Token": API_TOKEN,
+    }
+
+    payload = {
+        "text": text[:MAX_TEXT_LENGTH],
+    }
+
     async with _request_semaphore:
         try:
-            async with session.post(API_URL, json=payload, headers=headers) as response:
+            async with session.post(
+                API_URL,
+                json=payload,
+                headers=headers,
+            ) as response:
+
                 if response.status != 200:
                     body = (await response.text())[:300]
-                    logger.warning("Harmony API HTTP %s: %s", response.status, body)
+
+                    logger.warning(
+                        "Harmony HTTP %s: %s",
+                        response.status,
+                        body,
+                    )
+
                     return None
-                result = await response.json(content_type=None)
-                if not isinstance(result, dict) or "class" not in result:
-                    logger.warning("Harmony API вернул неожиданный ответ: %r", result)
+
+                result = await response.json(
+                    content_type=None,
+                )
+
+                if not isinstance(result, dict):
+                    logger.warning(
+                        "Harmony returned invalid JSON: %r",
+                        result,
+                    )
                     return None
+
+                if "class" not in result:
+                    logger.warning(
+                        "Harmony response has no class: %r",
+                        result,
+                    )
+                    return None
+
                 return result
-        except (aiohttp.ClientError, asyncio.TimeoutError, ValueError):
-            logger.exception("Не удалось обратиться к Harmony API")
-            return None
+
+        except asyncio.TimeoutError:
+            logger.warning("Harmony request timeout")
+
+        except aiohttp.ClientError:
+            logger.exception("Harmony connection error")
+
+        except ValueError:
+            logger.exception("Harmony JSON parsing error")
+
+        except Exception:
+            logger.exception("Unexpected Harmony error")
+
+    return None
 
 
-def _user_lock(chat_id: int, user_id: int) -> asyncio.Lock:
+# ============================================================
+# USER LOCKS
+# ============================================================
+
+def _user_lock(
+    chat_id: int,
+    user_id: int,
+) -> asyncio.Lock:
+
     key = (chat_id, user_id)
+
     lock = _user_locks.get(key)
+
     if lock is None:
         lock = asyncio.Lock()
         _user_locks[key] = lock
+
     return lock
 
 
-async def _try_mute(bot, chat_id: int, user_id: int) -> bool:
-    until = datetime.now(timezone.utc) + timedelta(seconds=MUTE_SECONDS)
+# ============================================================
+# AUTOMATIC MUTE
+# ============================================================
+
+async def _try_mute(
+    bot,
+    chat_id: int,
+    user_id: int,
+) -> bool:
+
+    until = (
+        datetime.now(timezone.utc)
+        + timedelta(seconds=MUTE_SECONDS)
+    )
+
     try:
         await bot.restrict_chat_member(
             chat_id=chat_id,
@@ -205,11 +693,26 @@ async def _try_mute(bot, chat_id: int, user_id: int) -> bool:
             permissions=_permissions_muted(),
             until_date=until,
         )
+
+        logger.info(
+            "Automatic mute applied: user=%s",
+            user_id,
+        )
+
         return True
+
     except TelegramError:
-        logger.exception("Не удалось автоматически замутить user_id=%s", user_id)
+        logger.exception(
+            "Unable to mute user_id=%s",
+            user_id,
+        )
+
         return False
 
+
+# ============================================================
+# ADMIN NOTIFICATION
+# ============================================================
 
 async def _notify_admin(
     bot,
@@ -223,29 +726,58 @@ async def _notify_admin(
     auto_muted: bool,
     toxic_score: float,
 ) -> None:
-    shown_name = f"@{username}" if username else (first_name or "Пользователь")
+
+    shown_name = (
+        f"@{username}"
+        if username
+        else (first_name or "Пользователь")
+    )
+
     user_link = (
-        f'<a href="tg://user?id={user_id}">{html.escape(shown_name)}</a>'
+        f'<a href="tg://user?id={user_id}">'
+        f'{html.escape(shown_name)}'
+        f'</a>'
     )
+
     mute_line = (
-        "🔇 Автоматический мут на 24 часа уже применён."
+        "🔇 Автоматический мут на 24 часа применён."
         if auto_muted
-        else "⚠️ Автоматический мут не применился — проверьте права бота."
+        else "⚠️ Мут не применился. Проверьте права бота."
     )
+
     text = (
-        "⚠️ <b>Система безопасности обнаружила нарушителя</b>\n\n"
+        "⚠️ <b>Ksenya AI Security обнаружила нарушителя</b>\n\n"
         f"Пользователь: {user_link}\n"
-        f"Нарушений за 2 часа: <b>{count}</b> из {VIOLATION_THRESHOLD}\n"
-        f"Последняя токсичность: <b>{toxic_score:.2f}%</b>\n"
-        f"Модель: <code>Ksenya AI Security</code>\n"
+        f"Нарушений за 2 часа: <b>{count}</b> "
+        f"из {VIOLATION_THRESHOLD}\n"
+        f"Последняя токсичность: "
+        f"<b>{toxic_score * 100:.2f}%</b>\n"
+        "Модель: <code>floxoris/harmony-v1.2</code>\n"
         f"{mute_line}\n\n"
-        f"Ожидаем решение {ADMIN_MENTION}"
+        f"Ожидается решение {ADMIN_MENTION}"
     )
+
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Ошибка", callback_data=f"modai:wrong:{alert_id}")],
-        [InlineKeyboardButton("Бан", callback_data=f"modai:ban:{alert_id}")],
-        [InlineKeyboardButton("Оставить мут", callback_data=f"modai:mute:{alert_id}")],
+        [
+            InlineKeyboardButton(
+                "❌ Ошибка",
+                callback_data=f"modai:wrong:{alert_id}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🔨 Бан",
+                callback_data=f"modai:ban:{alert_id}",
+            )
+        ],
+        [
+            InlineKeyboardButton(
+                "🔇 Оставить мут",
+                callback_data=f"modai:mute:{alert_id}",
+            )
+        ],
     ])
+
     await bot.send_message(
         chat_id=chat_id,
         text=text,
@@ -254,6 +786,10 @@ async def _notify_admin(
         disable_web_page_preview=True,
     )
 
+
+# ============================================================
+# SAVE VIOLATION
+# ============================================================
 
 async def _save_violation(
     *,
@@ -266,72 +802,174 @@ async def _save_violation(
     first_name: str,
     username: str | None,
 ) -> None:
+
     now = int(time.time())
     cutoff = now - WINDOW_SECONDS
+
     lock = _user_lock(chat_id, user_id)
 
     async with lock:
-        inserted = await db._exec(
-            """INSERT OR IGNORE INTO ai_moderation_violations
-               (chat_id, user_id, message_id, message_text, toxic_score, created_at)
-               VALUES (?, ?, ?, ?, ?, ?)""",
-            [chat_id, user_id, message_id, message_text[:1000], toxic_score, now],
-        )
-        if getattr(inserted, "error", False):
-            logger.error("Не удалось сохранить AI-нарушение user_id=%s", user_id)
-            return
-        if int(getattr(inserted, "rows_affected", 0) or 0) == 0:
-            return  # повторная обработка одного и того же Telegram message_id
 
+        inserted = await db._exec(
+            """
+            INSERT OR IGNORE INTO ai_moderation_violations
+            (
+                chat_id,
+                user_id,
+                message_id,
+                message_text,
+                toxic_score,
+                created_at
+            )
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                chat_id,
+                user_id,
+                message_id,
+                message_text[:MAX_TEXT_LENGTH],
+                toxic_score,
+                now,
+            ],
+        )
+
+        if getattr(inserted, "error", False):
+            logger.error(
+                "Failed to save violation user=%s",
+                user_id,
+            )
+            return
+
+        if int(
+            getattr(inserted, "rows_affected", 0) or 0
+        ) == 0:
+            return
+
+        # Удаляем старые нарушения.
         await db._exec(
-            "DELETE FROM ai_moderation_violations WHERE created_at < ?",
+            """
+            DELETE FROM ai_moderation_violations
+            WHERE created_at < ?
+            """,
             [cutoff],
         )
+
         count_rs = await db._exec(
-            """SELECT COUNT(*) FROM ai_moderation_violations
-               WHERE chat_id = ? AND user_id = ? AND created_at >= ?""",
+            """
+            SELECT COUNT(*)
+            FROM ai_moderation_violations
+            WHERE chat_id = ?
+              AND user_id = ?
+              AND created_at >= ?
+            """,
             [chat_id, user_id, cutoff],
         )
-        if getattr(count_rs, "error", False) or not count_rs.rows:
-            return
-        count = int(count_rs.rows[0][0] or 0)
-        if count < VIOLATION_THRESHOLD:
-            logger.info(
-                "AI violation %s/%s: user_id=%s chat_id=%s",
-                count, VIOLATION_THRESHOLD, user_id, chat_id,
-            )
+
+        if (
+            getattr(count_rs, "error", False)
+            or not count_rs.rows
+        ):
             return
 
+        count = int(count_rs.rows[0][0] or 0)
+
+        logger.info(
+            "AI violation %s/%s user=%s score=%.2f%%",
+            count,
+            VIOLATION_THRESHOLD,
+            user_id,
+            toxic_score * 100,
+        )
+
+        if count < VIOLATION_THRESHOLD:
+            return
+
+        # Проверяем, нет ли уже открытой карточки.
         pending_rs = await db._exec(
-            """SELECT alert_id FROM ai_moderation_alerts
-               WHERE chat_id = ? AND user_id = ? AND status = 'pending' LIMIT 1""",
+            """
+            SELECT alert_id
+            FROM ai_moderation_alerts
+            WHERE chat_id = ?
+              AND user_id = ?
+              AND status = 'pending'
+            LIMIT 1
+            """,
             [chat_id, user_id],
         )
+
         if pending_rs.rows:
             await db._exec(
-                "UPDATE ai_moderation_alerts SET violation_count = ? WHERE alert_id = ?",
-                [count, pending_rs.rows[0][0]],
+                """
+                UPDATE ai_moderation_alerts
+                SET violation_count = ?
+                WHERE alert_id = ?
+                """,
+                [
+                    count,
+                    pending_rs.rows[0][0],
+                ],
             )
+
             return
 
         alert_id = secrets.token_hex(6)
+
         created = await db._exec(
-            """INSERT INTO ai_moderation_alerts
-               (alert_id, chat_id, user_id, violation_count, status, auto_muted, created_at, muted_until)
-               VALUES (?, ?, ?, ?, 'pending', 0, ?, NULL)""",
-            [alert_id, chat_id, user_id, count, now],
+            """
+            INSERT INTO ai_moderation_alerts
+            (
+                alert_id,
+                chat_id,
+                user_id,
+                violation_count,
+                status,
+                auto_muted,
+                created_at,
+                muted_until
+            )
+            VALUES (?, ?, ?, ?, 'pending', 0, ?, NULL)
+            """,
+            [
+                alert_id,
+                chat_id,
+                user_id,
+                count,
+                now,
+            ],
         )
+
         if getattr(created, "error", False):
-            logger.exception("Не удалось создать карточку AI-модерации")
+            logger.error(
+                "Failed to create moderation alert user=%s",
+                user_id,
+            )
             return
 
-        # Сначала сохраняем карточку, и только затем применяем мут: даже если
-        # Telegram не даст ограничить пользователя, у администратора останутся кнопки.
-        auto_muted = await _try_mute(bot, chat_id, user_id)
-        muted_until = now + MUTE_SECONDS if auto_muted else None
+        # Сначала карточка в БД, затем ограничение пользователя.
+        auto_muted = await _try_mute(
+            bot,
+            chat_id,
+            user_id,
+        )
+
+        muted_until = (
+            now + MUTE_SECONDS
+            if auto_muted
+            else None
+        )
+
         await db._exec(
-            "UPDATE ai_moderation_alerts SET auto_muted = ?, muted_until = ? WHERE alert_id = ?",
-            [1 if auto_muted else 0, muted_until, alert_id],
+            """
+            UPDATE ai_moderation_alerts
+            SET auto_muted = ?,
+                muted_until = ?
+            WHERE alert_id = ?
+            """,
+            [
+                1 if auto_muted else 0,
+                muted_until,
+                alert_id,
+            ],
         )
 
         try:
@@ -346,32 +984,71 @@ async def _save_violation(
                 auto_muted=auto_muted,
                 toxic_score=toxic_score,
             )
+
         except TelegramError:
-            logger.exception("Не удалось отправить уведомление AI-модерации")
+            logger.exception(
+                "Failed to send moderation notification"
+            )
 
 
-async def _process_message(message, bot) -> None:
-    text = (message.text or message.caption or "").strip()
+# ============================================================
+# PROCESS MESSAGE
+# ============================================================
+
+async def _process_message(
+    message,
+    bot,
+) -> None:
+
+    text = (
+        message.text
+        or message.caption
+        or ""
+    ).strip()
+
+    if not text:
+        return
+
     result = await _classify(text)
+
     if not result:
         return
 
     try:
-        is_toxic = int(result.get("class", 0)) == 1
-        toxic_score = float(result.get("toxic_score", 0.0))
+        classification = int(result.get("class", 0))
+
+        if classification not in (0, 1):
+            logger.warning(
+                "Unknown Harmony class: %r",
+                classification,
+            )
+            return
+
+        toxic_score = _parse_score(
+            result.get("toxic_score", 0)
+        )
+
     except (TypeError, ValueError):
-        logger.warning("Некорректные поля ответа Harmony: %r", result)
+        logger.warning(
+            "Invalid Harmony result: %r",
+            result,
+        )
         return
 
     logger.info(
-        "Harmony check user_id=%s message_id=%s class=%s toxic=%.2f%% latency=%s ms",
+        "Harmony: user=%s message=%s class=%s "
+        "toxic=%.2f%% latency=%s",
         message.from_user.id if message.from_user else None,
         message.message_id,
-        result.get("class"),
+        classification,
         toxic_score * 100,
         result.get("latency_ms"),
     )
-    if not is_toxic or not message.from_user:
+
+    if classification != 1:
+        return
+
+    if not message.from_user:
         return
 
     await _save_violation(
@@ -386,123 +1063,303 @@ async def _process_message(message, bot) -> None:
     )
 
 
-async def check_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Handler: быстро отбирает кандидатов и проверяет их в фоне."""
+# ============================================================
+# MAIN MESSAGE HANDLER
+# ============================================================
+
+async def check_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """
+    Регистрируется как обычный message handler.
+    Никаких запросов к Harmony при каждом сообщении нет.
+    """
+
     message = update.effective_message
     chat = update.effective_chat
     user = update.effective_user
-    if not message or not chat or not user or user.is_bot:
+
+    if not message or not chat or not user:
         return
-    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+
+    if user.is_bot:
         return
+
+    if chat.type not in (
+        ChatType.GROUP,
+        ChatType.SUPERGROUP,
+    ):
+        return
+
     if CHAT_ID and chat.id != CHAT_ID:
         return
+
+    # Не проверяем команды.
     if message.text and message.text.startswith("/"):
         return
 
-    text = (message.text or message.caption or "").strip()
-    if not text or not _is_candidate(text):
+    text = (
+        message.text
+        or message.caption
+        or ""
+    ).strip()
+
+    if not text:
         return
+
     if not API_TOKEN:
         return
 
-    task = asyncio.create_task(_process_message(message, context.bot))
-    _background_tasks.add(task)
+    # Самое важное: локальная проверка.
+    # Обычные сообщения вообще не отправляются модели.
+    if not _is_candidate(text):
+        return
 
-    def _task_done(done: asyncio.Task) -> None:
-        _background_tasks.discard(done)
-        try:
-            done.result()
-        except asyncio.CancelledError:
-            pass
-        except Exception:
-            logger.exception("Фоновая задача AI-модерации завершилась с ошибкой")
+    # Запускаем очередь, если она ещё не запущена.
+    if _queue is None or not _workers:
+        _start_workers()
 
-    task.add_done_callback(_task_done)
+    key = (message.chat_id, message.message_id)
 
+    if key in _queued_messages:
+        return
+
+    _queued_messages.add(key)
+
+    try:
+        _queue.put_nowait(
+            (message, context.bot)
+        )
+
+        logger.debug(
+            "Candidate queued: user=%s message=%s queue=%s",
+            user.id,
+            message.message_id,
+            _queue.qsize(),
+        )
+
+    except asyncio.QueueFull:
+        _queued_messages.discard(key)
+
+        logger.warning(
+            "AI moderation queue full. "
+            "Message skipped: user=%s message=%s",
+            user.id,
+            message.message_id,
+        )
+
+
+# ============================================================
+# ADMIN CALLBACKS
+# ============================================================
 
 async def moderation_callback(
     update: Update,
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
+
     query = update.callback_query
+
     if not query or not query.data:
         return
+
     if not ADMIN_ID or query.from_user.id != ADMIN_ID:
-        await query.answer("Эта кнопка доступна только администратору.", show_alert=True)
+        await query.answer(
+            "Эта кнопка доступна только администратору.",
+            show_alert=True,
+        )
         return
 
     try:
         _, action, alert_id = query.data.split(":", 2)
+
     except ValueError:
-        await query.answer("Некорректная кнопка.", show_alert=True)
+        await query.answer(
+            "Некорректная кнопка.",
+            show_alert=True,
+        )
+        return
+
+    if action not in ("wrong", "ban", "mute"):
+        await query.answer(
+            "Неизвестное действие.",
+            show_alert=True,
+        )
         return
 
     rs = await db._exec(
-        """SELECT chat_id, user_id, status, auto_muted
-           FROM ai_moderation_alerts WHERE alert_id = ? LIMIT 1""",
+        """
+        SELECT chat_id, user_id, status, auto_muted
+        FROM ai_moderation_alerts
+        WHERE alert_id = ?
+        LIMIT 1
+        """,
         [alert_id],
     )
-    if getattr(rs, "error", False) or not rs.rows:
-        await query.answer("Карточка не найдена.", show_alert=True)
+
+    if (
+        getattr(rs, "error", False)
+        or not rs.rows
+    ):
+        await query.answer(
+            "Карточка не найдена.",
+            show_alert=True,
+        )
         return
 
     chat_id, user_id, status, auto_muted = rs.rows[0]
-    chat_id, user_id = int(chat_id), int(user_id)
+
+    chat_id = int(chat_id)
+    user_id = int(user_id)
+
     if status != "pending":
-        await query.answer("Это предупреждение уже обработано.", show_alert=True)
+        await query.answer(
+            "Это предупреждение уже обработано.",
+            show_alert=True,
+        )
         return
 
-    try:
-        if action == "wrong":
-            if int(auto_muted or 0):
+    lock = _user_lock(chat_id, user_id)
+
+    async with lock:
+        # Повторно проверяем статус под блокировкой.
+        current = await db._exec(
+            """
+            SELECT status, auto_muted
+            FROM ai_moderation_alerts
+            WHERE alert_id = ?
+            LIMIT 1
+            """,
+            [alert_id],
+        )
+
+        if not current.rows or current.rows[0][0] != "pending":
+            await query.answer(
+                "Карточка уже обработана.",
+                show_alert=True,
+            )
+            return
+
+        auto_muted = int(current.rows[0][1] or 0)
+
+        try:
+            if action == "wrong":
+
+                if auto_muted:
+                    await context.bot.restrict_chat_member(
+                        chat_id=chat_id,
+                        user_id=user_id,
+                        permissions=_permissions_unmuted(),
+                    )
+
+                await db._exec(
+                    """
+                    DELETE FROM ai_moderation_violations
+                    WHERE chat_id = ?
+                      AND user_id = ?
+                      AND created_at >= ?
+                    """,
+                    [
+                        chat_id,
+                        user_id,
+                        int(time.time()) - WINDOW_SECONDS,
+                    ],
+                )
+
+                await db._exec(
+                    """
+                    UPDATE ai_moderation_alerts
+                    SET status = 'false_positive'
+                    WHERE alert_id = ?
+                    """,
+                    [alert_id],
+                )
+
+                result_text = (
+                    "❌ Администратор отменил срабатывание. "
+                    "Нарушения за последние 2 часа очищены."
+                )
+
+            elif action == "ban":
+
+                await context.bot.ban_chat_member(
+                    chat_id=chat_id,
+                    user_id=user_id,
+                )
+
+                await db._exec(
+                    """
+                    UPDATE ai_moderation_alerts
+                    SET status = 'banned'
+                    WHERE alert_id = ?
+                    """,
+                    [alert_id],
+                )
+
+                result_text = (
+                    "🔨 Пользователь заблокирован администратором."
+                )
+
+            elif action == "mute":
+
+                until = (
+                    datetime.now(timezone.utc)
+                    + timedelta(seconds=MUTE_SECONDS)
+                )
+
                 await context.bot.restrict_chat_member(
                     chat_id=chat_id,
                     user_id=user_id,
-                    permissions=_permissions_unmuted(),
+                    permissions=_permissions_muted(),
+                    until_date=until,
                 )
-            await db._exec(
-                "DELETE FROM ai_moderation_violations WHERE chat_id = ? AND user_id = ? AND created_at >= ?",
-                [chat_id, user_id, int(time.time()) - WINDOW_SECONDS],
-            )
-            await db._exec(
-                "UPDATE ai_moderation_alerts SET status = 'false_positive' WHERE alert_id = ?",
-                [alert_id],
-            )
-            result_text = "❌ Администратор отменил срабатывание. Нарушения за последние 2 часа очищены."
-        elif action == "ban":
-            await context.bot.ban_chat_member(chat_id=chat_id, user_id=user_id)
-            await db._exec(
-                "UPDATE ai_moderation_alerts SET status = 'banned' WHERE alert_id = ?",
-                [alert_id],
-            )
-            result_text = "🔨 Пользователь заблокирован администратором."
-        elif action == "mute":
-            until = datetime.now(timezone.utc) + timedelta(seconds=MUTE_SECONDS)
-            await context.bot.restrict_chat_member(
-                chat_id=chat_id,
-                user_id=user_id,
-                permissions=_permissions_muted(),
-                until_date=until,
-            )
-            await db._exec(
-                "UPDATE ai_moderation_alerts SET status = 'muted', auto_muted = 1, muted_until = ? WHERE alert_id = ?",
-                [int(time.time()) + MUTE_SECONDS, alert_id],
-            )
-            result_text = "🔇 Мут на 24 часа подтверждён администратором."
-        else:
-            await query.answer("Неизвестное действие.", show_alert=True)
-            return
 
-        await query.answer("Решение сохранено.")
-        if query.message:
-            old_text = query.message.text_html or query.message.text or ""
-            await query.edit_message_text(
-                f"{old_text}\n\n<b>{html.escape(result_text)}</b>",
-                parse_mode=ParseMode.HTML,
-                reply_markup=None,
-                disable_web_page_preview=True,
+                await db._exec(
+                    """
+                    UPDATE ai_moderation_alerts
+                    SET status = 'muted',
+                        auto_muted = 1,
+                        muted_until = ?
+                    WHERE alert_id = ?
+                    """,
+                    [
+                        int(time.time()) + MUTE_SECONDS,
+                        alert_id,
+                    ],
+                )
+
+                result_text = (
+                    "🔇 Мут на 24 часа подтверждён администратором."
+                )
+
+            await query.answer(
+                "Решение сохранено."
             )
-    except TelegramError:
-        logger.exception("Ошибка выполнения действия AI-модерации: %s", action)
-        await query.answer("Telegram не выполнил действие. Проверь права бота.", show_alert=True)
+
+            if query.message:
+                old_text = (
+                    query.message.text_html
+                    or query.message.text
+                    or ""
+                )
+
+                await query.edit_message_text(
+                    f"{old_text}\n\n"
+                    f"<b>{html.escape(result_text)}</b>",
+                    parse_mode=ParseMode.HTML,
+                    reply_markup=None,
+                    disable_web_page_preview=True,
+                )
+
+        except TelegramError:
+            logger.exception(
+                "Moderation action failed: %s",
+                action,
+            )
+
+            await query.answer(
+                "Telegram не выполнил действие. "
+                "Проверь права бота.",
+                show_alert=True,
+            )
