@@ -9,8 +9,8 @@ Ksenya AI Security — многоступенчатая AI-модерация Te
 - Обнаружение слов, разделённых пробелами.
 - Контекстные выражения.
 - Ограниченная очередь сообщений.
-- Не более 3 одновременных запросов Harmony.
-- Таймауты и защита от зависших запросов.
+- Один одновременный запрос Harmony, чтобы не перегружать API.
+- Увеличенный таймаут для холодного старта Render и защита от зависших запросов.
 - Сохранение нарушений в Turso.
 - 5 нарушений за 2 часа = мут на 24 часа.
 - Карточки администратору с кнопками.
@@ -65,12 +65,17 @@ VIOLATION_THRESHOLD = 5
 WINDOW_SECONDS = 2 * 60 * 60
 MUTE_SECONDS = 24 * 60 * 60
 
-REQUEST_TIMEOUT_SECONDS = 10
+# Render free-сервис может просыпаться после простоя. Даем API время
+# на холодный старт, но не создаём много параллельных запросов.
+REQUEST_TIMEOUT_SECONDS = 70
+CONNECT_TIMEOUT_SECONDS = 12
+SOCK_READ_TIMEOUT_SECONDS = 60
 
-MAX_PARALLEL_REQUESTS = 3
+# Один запрос одновременно: не перегружаем небольшой сервер Harmony.
+MAX_PARALLEL_REQUESTS = 1
 
-# Максимум сообщений, ожидающих обработки.
-MAX_QUEUE_SIZE = 100
+# Ограниченная очередь. При перегрузке бот не блокирует обработку чата.
+MAX_QUEUE_SIZE = 250
 
 # Максимальная длина текста для Harmony.
 MAX_TEXT_LENGTH = 1000
@@ -94,47 +99,72 @@ _queued_messages: set[tuple[int, int]] = set()
 # NORMALIZATION
 # ============================================================
 
+# Нормализация распространённых замен букв цифрами и латинскими
+# символами-двойниками. Это только вспомогательный вариант текста:
+# исходное сообщение не изменяется.
 _TRANSLATION = str.maketrans({
-    "0": "о",
-    "1": "и",
-    "3": "з",
-    "4": "ч",
-    "5": "с",
-    "6": "б",
-    "8": "в",
-    "@": "а",
-    "$": "с",
-    "ё": "е",
+    "0": "о", "1": "и", "3": "з", "4": "ч",
+    "5": "с", "6": "б", "8": "в",
+    "@": "а", "$": "с", "ё": "е",
+    "a": "а", "c": "с", "e": "е", "o": "о",
+    "p": "р", "x": "х", "y": "у", "k": "к",
+    "m": "м", "t": "т", "b": "в", "h": "н",
 })
 
 
 def _normalize_for_filter(text: str) -> list[str]:
-    """
-    Возвращает несколько вариантов текста для поиска обходов фильтра.
-    """
-
+    """Создаёт варианты текста для поиска замаскированных нарушений."""
     if not text:
         return []
 
-    text = unicodedata.normalize("NFKC", text).lower()
+    value = unicodedata.normalize("NFKC", text).lower()
+    value = re.sub(r"[\u200b-\u200f\u202a-\u202e\ufeff\u2060]", "", value)
+    value = value.replace("ё", "е")
 
-    # Удаляем невидимые символы.
-    text = re.sub(r"[\u200b-\u200f\u202a-\u202e\ufeff]", "", text)
+    # Оригинал с нормализацией регистра и невидимых символов.
+    normalized = value
 
-    # Нормализация цифр и похожих символов.
-    normalized = text.translate(_TRANSLATION)
+    # Вариант с цифрами и визуально похожими латинскими буквами.
+    homoglyphs = value.translate(_TRANSLATION)
 
-    # Вариант без пробелов и разделителей между буквами.
-    compact = re.sub(
-        r"(?<=[a-zа-яё0-9])[\s._*+\-]+(?=[a-zа-яё0-9])",
+    # Убираем знаки между буквами: п-и-з-д-а, п.и.з.д.а, п и з д а.
+    # Сохраняем отдельный compact-variant исходника, чтобы не терять
+    # транслит вроде b l y a t при нормализации похожих латинских букв.
+    compact_original = re.sub(
+        r"(?<=[a-zа-я0-9])[\W_]{1,4}(?=[a-zа-я0-9])",
         "",
         normalized,
+        flags=re.IGNORECASE,
+    )
+    compact = re.sub(
+        r"(?<=[a-zа-я0-9])[\W_]{1,4}(?=[a-zа-я0-9])",
+        "",
+        homoglyphs,
+        flags=re.IGNORECASE,
     )
 
-    # Вариант без разделителей вообще.
-    compact_all = re.sub(r"[\s._*+\-]+", "", normalized)
+    # Более агрессивный вариант для обходов через несколько символов.
+    compact_all = re.sub(r"[\W_]+", "", homoglyphs, flags=re.UNICODE)
+    compact_original_all = re.sub(r"[\W_]+", "", normalized, flags=re.UNICODE)
 
-    return [normalized, compact, compact_all]
+    # Схлопываем длинные повторы: бляяяя -> бляя, суууука -> суука.
+    compact_repeat = re.sub(r"(.)\1{2,}", r"\1\1", compact, flags=re.DOTALL)
+    compact_original_repeat = re.sub(
+        r"(.)\1{2,}", r"\1\1", compact_original, flags=re.DOTALL
+    )
+
+    # Убираем повторные пробелы, сохраняя границы слов.
+    spaced = re.sub(r"\s+", " ", homoglyphs).strip()
+
+    # Уникальные варианты в исходном порядке.
+    return list(dict.fromkeys(
+        item for item in (
+            normalized, homoglyphs, spaced, compact_original, compact,
+            compact_all, compact_original_all, compact_repeat,
+            compact_original_repeat
+        )
+        if item
+    ))
 
 
 # ============================================================
@@ -306,6 +336,29 @@ _SUSPICIOUS_RE = re.compile(
 )
 
 
+# Дополнительные признаки: угрозы, унижение, домогательства и транслит.
+# Они только направляют сообщение на Harmony, а не приводят к автоматическому муту.
+_EXTRA_SUSPICIOUS_RE = re.compile(
+    r"(?iu)("
+    r"сдохн(и|ите|ет)|"
+    r"чтоб\s+ты\s+(сдох|умер|сдохла)|"
+    r"лучше\s+бы\s+ты\s+(умер|сдох)|"
+    r"закрой\s+(свой\s+)?(рот|пасть)|"
+    r"заткнись|"
+    r"пош[её]л\s+в\sон|"
+    r"иди\s+в\sон|"
+    r"тебя\s+надо\s+(убить|избить|уничтожить)|"
+    r"я\s+тебя\s+(найду|достану|прибью|покалечу)|"
+    r"скинь\s+(нюдс|голые\s+фото|обнаженн\w*)|"
+    r"покажи\s+(сиськи|грудь|письку|член)|"
+    r"разденься|отсоси|"
+    r"ты\s+(кончен\w*|ебан\w*|долбан\w*|тупиц\w*|кретин\w*)|"
+    r"сборище\s+(дебил\w*|идиот\w*)|"
+    r"никч[её]мн\w*|"
+    r"fuck\w*|b[i1]tch\w*|asshole\w*|motherfucker\w*|retard\w*"
+    r")"
+)
+
 # Дополнительные контекстные признаки.
 _CONTEXT_RE = re.compile(
     r"(?iu)("
@@ -339,6 +392,9 @@ def _is_candidate(text: str) -> bool:
 
     for variant in variants:
         if _SUSPICIOUS_RE.search(variant):
+            return True
+
+        if _EXTRA_SUSPICIOUS_RE.search(variant):
             return True
 
         if _CONTEXT_RE.search(variant):
@@ -508,7 +564,8 @@ async def _get_session() -> aiohttp.ClientSession:
     if _session is None or _session.closed:
         timeout = aiohttp.ClientTimeout(
             total=REQUEST_TIMEOUT_SECONDS,
-            connect=4,
+            connect=CONNECT_TIMEOUT_SECONDS,
+            sock_read=SOCK_READ_TIMEOUT_SECONDS,
         )
 
         connector = aiohttp.TCPConnector(
