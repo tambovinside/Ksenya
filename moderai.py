@@ -641,9 +641,12 @@ async def _save_violation(
             return
 
         # Проверяем, нет ли уже открытой карточки.
+        # Если карточка существует, НЕ выходим сразу:
+        # проверяем, действует ли автоматический мут. Если мут не был
+        # применён или уже истёк, пробуем применить его повторно.
         pending_rs = await db._exec(
             """
-            SELECT alert_id
+            SELECT alert_id, auto_muted, muted_until
             FROM ai_moderation_alerts
             WHERE chat_id = ?
               AND user_id = ?
@@ -653,18 +656,84 @@ async def _save_violation(
             [chat_id, user_id],
         )
 
-        if pending_rs.rows:
-            await db._exec(
-                """
-                UPDATE ai_moderation_alerts
-                SET violation_count = ?
-                WHERE alert_id = ?
-                """,
-                [
-                    count,
-                    pending_rs.rows[0][0],
-                ],
+        if getattr(pending_rs, "error", False):
+            logger.error(
+                "Failed to check pending moderation alert user=%s",
+                user_id,
             )
+            return
+
+        if pending_rs.rows:
+            existing_alert_id, was_auto_muted, old_muted_until = pending_rs.rows[0]
+            was_auto_muted = int(was_auto_muted or 0)
+            old_muted_until = int(old_muted_until or 0)
+
+            # Не продлеваем мут на каждое сообщение, пока он ещё действует.
+            # Но если мут не сработал или срок закончился — пробуем снова.
+            mute_is_active = (
+                was_auto_muted == 1
+                and old_muted_until > now
+            )
+
+            if not mute_is_active:
+                auto_muted = await _try_mute(
+                    bot,
+                    chat_id,
+                    user_id,
+                )
+
+                if auto_muted:
+                    muted_until = now + MUTE_SECONDS
+                    await db._exec(
+                        """
+                        UPDATE ai_moderation_alerts
+                        SET violation_count = ?,
+                            auto_muted = 1,
+                            muted_until = ?
+                        WHERE alert_id = ?
+                        """,
+                        [
+                            count,
+                            muted_until,
+                            existing_alert_id,
+                        ],
+                    )
+                    logger.info(
+                        "Automatic mute retry succeeded: user=%s alert=%s",
+                        user_id,
+                        existing_alert_id,
+                    )
+                else:
+                    await db._exec(
+                        """
+                        UPDATE ai_moderation_alerts
+                        SET violation_count = ?,
+                            auto_muted = 0,
+                            muted_until = NULL
+                        WHERE alert_id = ?
+                        """,
+                        [
+                            count,
+                            existing_alert_id,
+                        ],
+                    )
+                    logger.error(
+                        "Automatic mute retry failed: user=%s alert=%s",
+                        user_id,
+                        existing_alert_id,
+                    )
+            else:
+                await db._exec(
+                    """
+                    UPDATE ai_moderation_alerts
+                    SET violation_count = ?
+                    WHERE alert_id = ?
+                    """,
+                    [
+                        count,
+                        existing_alert_id,
+                    ],
+                )
 
             return
 
