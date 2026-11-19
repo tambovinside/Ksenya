@@ -237,14 +237,14 @@ async def _notify_admin(
         f"Пользователь: {user_link}\n"
         f"Нарушений за 2 часа: <b>{count}</b> из {VIOLATION_THRESHOLD}\n"
         f"Последняя токсичность: <b>{toxic_score:.2f}%</b>\n"
-        f"Модель: <code>floxoris/harmony-v1.2</code>\n"
+        f"Модель: <code>Ksenya AI Security</code>\n"
         f"{mute_line}\n\n"
-        f"{ADMIN_MENTION}, выберите действие:"
+        f"Ожидаем решение {ADMIN_MENTION}"
     )
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("❌ Ты ошиблась", callback_data=f"modai:wrong:{alert_id}")],
-        [InlineKeyboardButton("🔨 Бан", callback_data=f"modai:ban:{alert_id}")],
-        [InlineKeyboardButton("🔇 Мут на 24 часа", callback_data=f"modai:mute:{alert_id}")],
+        [InlineKeyboardButton("Ошибка", callback_data=f"modai:wrong:{alert_id}")],
+        [InlineKeyboardButton("Бан", callback_data=f"modai:ban:{alert_id}")],
+        [InlineKeyboardButton("Оставить мут", callback_data=f"modai:mute:{alert_id}")],
     ])
     await bot.send_message(
         chat_id=chat_id,
