@@ -1,0 +1,1250 @@
+"""Точка входа: webhook-версия для Render Web Service (Free)."""
+
+import os
+import re
+import logging
+from datetime import datetime, time as dtime, timezone
+from telegram import Update
+from telegram.request import HTTPXRequest
+from telegram.constants import ParseMode
+from telegram.ext import (
+    Application, CommandHandler, MessageHandler, CallbackQueryHandler,
+    TypeHandler, ContextTypes, filters, ApplicationHandlerStop,
+)
+
+import db
+import accounts
+import resolver
+import pr
+import roles
+import top
+import words
+import ship
+import wedding
+import profile
+import economy
+import tictactoe
+import sss
+import complaints
+import warns
+import aura
+import aura_admin
+import awards
+import actions
+import ai
+import help_menu
+import casino
+import polls
+import rules
+import command_registry   # noqa: F401 — должен идти до commands_dop
+import commands_dop       # noqa: F401 — регистрирует команды в реестре
+import commands_dop_handlers
+import shop
+import premium
+import reputation
+import blacklist
+import helper
+import home_menu
+import secretsms
+import abrakadabra
+import my_article
+
+
+logging.basicConfig(
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    level=logging.INFO,
+)
+logging.getLogger("httpx").setLevel(logging.WARNING)
+logger = logging.getLogger(__name__)
+
+
+def _env_int(name: str, default: int = 0, *, minimum: int | None = None,
+             maximum: int | None = None) -> int:
+    """Безопасно читает целочисленную переменную окружения."""
+    raw = os.getenv(name)
+    try:
+        value = int(raw) if raw not in (None, "") else default
+    except (TypeError, ValueError):
+        logger.error("Некорректное значение %s=%r; используется %s", name, raw, default)
+        value = default
+    if minimum is not None and value < minimum:
+        logger.error("%s меньше допустимого минимума; используется %s", name, minimum)
+        value = minimum
+    if maximum is not None and value > maximum:
+        logger.error("%s больше допустимого максимума; используется %s", name, maximum)
+        value = maximum
+    return value
+
+
+TOKEN = os.getenv("BOT_TOKEN")
+ADMIN_ID = _env_int("ADMIN_ID", 0, minimum=0)
+CHAT_ID = _env_int("CHAT_ID", 0)
+AI_THINKING_GIF = os.getenv("AI_THINKING_GIF", "0").strip().lower() in {
+    "1", "true", "yes", "on"
+}
+
+if not ADMIN_ID:
+    logger.error("main: ADMIN_ID не задан — админ-команды работать не будут!")
+
+PORT = _env_int("PORT", 10000, minimum=1, maximum=65535)
+WEBHOOK_URL = os.getenv("WEBHOOK_URL", "").rstrip("/")
+WEBHOOK_PATH = "webhook"
+
+# Обращения к Ксении
+_AI_WORD = re.compile(
+    r"(?i)^(ксюш(?:а|и)?|кеся|ксения|ксюха|ксю)(\s|$)"
+)
+
+
+class _CoinAmountReplyFilter(filters.MessageFilter):
+    """Пропускает только ответы на сообщение с запросом количества монет."""
+
+    def filter(self, message):
+        reply = message.reply_to_message
+        return bool(
+            reply
+            and "Введите количество монет" in (reply.text or "")
+        )
+
+
+async def _error_handler(
+    update: object,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    logger.exception("Unhandled exception", exc_info=context.error)
+
+
+async def cmd_start(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Показывает обновлённую главную панель."""
+    await home_menu.cmd_menu(update, context)
+
+
+async def cmd_datarega(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Админ-команда: /datarega ДД-ММ-ГГГГ @username."""
+    msg = update.effective_message
+    user = update.effective_user
+    if not msg:
+        return
+    if not user or not ADMIN_ID or user.id != ADMIN_ID:
+        await msg.reply_text("⛔ Только для администратора.")
+        return
+    if len(context.args) != 2:
+        await msg.reply_text(
+            "Формат: <code>/datarega 26-09-2026 @username</code>",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+    try:
+        parsed_date = datetime.strptime(context.args[0], "%d-%m-%Y")
+    except ValueError:
+        await msg.reply_text("❌ Неверная дата. Используй формат ДД-ММ-ГГГГ.")
+        return
+
+    username = context.args[1].strip().lstrip("@")
+    if not re.fullmatch(r"[A-Za-z0-9_]{5,32}", username):
+        await msg.reply_text("❌ Укажи корректный @username Telegram.")
+        return
+
+    target_id = None
+    try:
+        target_id = await db.get_user_by_username(username)
+    except Exception:
+        logger.exception("datarega: lookup username failed")
+    if not target_id:
+        try:
+            resolved = await resolver.resolve_username(username)
+            if resolved:
+                target_id = resolved[0]
+        except Exception:
+            logger.exception("datarega: resolver failed")
+    if not target_id:
+        await msg.reply_text("❌ Не нашёл пользователя. Он должен хотя бы раз написать в чате.")
+        return
+
+    try:
+        owner_id = await accounts.data_id_for(int(target_id))
+        ok = await accounts.set_registration_date(
+            owner_id, parsed_date.strftime("%Y-%m-%d")
+        )
+    except Exception:
+        logger.exception("datarega: update failed")
+        ok = False
+    if not ok:
+        await msg.reply_text("⚠️ Не удалось изменить дату в базе данных.")
+        return
+
+    months = (
+        "января", "февраля", "марта", "апреля", "мая", "июня",
+        "июля", "августа", "сентября", "октября", "ноября", "декабря",
+    )
+    date_text = f"{parsed_date.day} {months[parsed_date.month - 1]} {parsed_date.year}"
+    await msg.reply_text(
+        f"✅ Дата регистрации пользователя @{username} изменена на <b>{date_text}</b>.",
+        parse_mode=ParseMode.HTML,
+    )
+
+
+async def cmd_ping(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    msg = update.effective_message
+    if msg:
+        await msg.reply_text("pong 🏓")
+
+
+async def cmd_delete_message(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Удаляет сообщение-реплай и команду -смс."""
+
+    msg = update.effective_message
+    chat = update.effective_chat
+
+    if not msg or not chat:
+        return
+
+    if not await roles._require_role(update, ("commissar",)):
+        await msg.reply_text(
+            "⛔ Только владелец или комиссар могут использовать -смс."
+        )
+        return
+
+    target = msg.reply_to_message
+
+    if not target:
+        await msg.reply_text(
+            "Ответь командой <code>-смс</code> на сообщение, которое нужно удалить.",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    try:
+        await context.bot.delete_message(
+            chat_id=chat.id,
+            message_id=target.message_id,
+        )
+    except Exception as e:
+        logger.warning(
+            "cmd_delete_message: не удалось удалить цель: "
+            "chat_id=%s message_id=%s: %s",
+            chat.id,
+            target.message_id,
+            e,
+        )
+        await msg.reply_text(
+            "⚠️ Не удалось удалить отмеченное сообщение. "
+            "Проверь права бота администратора и возможность удаления этого сообщения."
+        )
+        return
+
+    try:
+        await msg.delete()
+    except Exception as e:
+        logger.warning(
+            "cmd_delete_message: цель удалена, но команда осталась: "
+            "chat_id=%s message_id=%s: %s",
+            chat.id,
+            msg.message_id,
+            e,
+        )
+
+
+async def cmd_restart(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    user = update.effective_user
+    msg = update.effective_message
+
+    if not user or not msg:
+        return
+
+    ai.reset_history(user.id)
+    await msg.reply_text("🔄 Контекст ИИ сброшен.")
+
+
+def _split_telegram_text(
+    text: str,
+    limit: int = 3900,
+) -> list[str]:
+    """Делит длинный ответ на сообщения."""
+
+    text = str(text or "")
+    chunks = []
+
+    while len(text) > limit:
+        cut = text.rfind("\n", 0, limit + 1)
+
+        if cut < limit // 2:
+            cut = text.rfind(" ", 0, limit + 1)
+
+        if cut < limit // 2:
+            cut = limit
+
+        chunks.append(text[:cut].strip())
+        text = text[cut:].strip()
+
+    if text:
+        chunks.append(text)
+
+    return chunks or [""]
+
+
+async def _run_ai(user, msg, prompt: str) -> None:
+    """Выполняет запрос к ИИ; GIF-индикатор отключён по умолчанию."""
+    remain = await ai.try_acquire(user.id)
+    if remain > 0:
+        # Не отправляем дополнительное сообщение при cooldown.
+        return
+
+    gif_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "videomateria.gif",
+    )
+
+    # GIF — необязательный индикатор ожидания. Если Telegram временно
+    # недоступен или файл отсутствует, сам запрос к ИИ всё равно выполняется.
+    thinking = None
+    if AI_THINKING_GIF and os.path.isfile(gif_path):
+        try:
+            with open(gif_path, "rb") as gif_file:
+                thinking = await msg.reply_animation(animation=gif_file)
+            logger.info(
+                "GIF отправлена: message_id=%s user_id=%s",
+                thinking.message_id,
+                user.id,
+            )
+        except Exception as exc:
+            logger.warning(
+                "Не удалось отправить GIF (запрос ИИ продолжится): "
+                "user_id=%s error=%s",
+                user.id,
+                exc,
+                exc_info=True,
+            )
+    elif AI_THINKING_GIF:
+        logger.warning("GIF не найдена: %s — продолжаю без анимации", gif_path)
+
+    answer = None
+    error_text = None
+    chunks = []
+
+    try:
+        logger.info("Начинаю генерацию ИИ: user_id=%s", user.id)
+        answer = await ai.ask_ai(prompt, user_id=user.id)
+        logger.info("Генерация ИИ завершена: user_id=%s", user.id)
+
+        needed = ai.count_words(prompt[:ai.MAX_PROMPT_CHARS].strip())
+
+        if not answer:
+            left = await db.get_ai_tokens(user.id)
+            if left < needed:
+                error_text = (
+                    f"🧠 Недостаточно токенов. Нужно {needed}, у тебя {left}.\n"
+                    "Купи токены в «Магазине» → «Токены ИИ»."
+                )
+            else:
+                error_text = (
+                    "⚠️ ИИ не ответил. Если токены были списаны, "
+                    "они возвращены. Попробуй позже."
+                )
+        elif answer.startswith("🧠 Недостаточно токенов:"):
+            error_text = answer
+        else:
+            left = await db.get_ai_tokens(user.id)
+            output_cost = ai.count_words(answer)
+            total_spent = needed + output_cost
+            chunks = _split_telegram_text(answer)
+            chunks[-1] += (
+                f"\n\n🧠 Списано: {total_spent} "
+                f"(запрос: {needed}, ответ: {output_cost}) · Осталось: {left}"
+            )
+
+    except Exception:
+        logger.exception("Ошибка генерации ИИ: user_id=%s", user.id)
+        error_text = "⚠️ Ошибка ИИ. Попробуй позже."
+
+    finally:
+        # GIF удаляется после окончания генерации и ДО текстового ответа.
+        if thinking is not None:
+            try:
+                await thinking.delete()
+                logger.info(
+                    "GIF удалена: message_id=%s user_id=%s",
+                    thinking.message_id,
+                    user.id,
+                )
+            except Exception:
+                logger.exception(
+                    "Не удалось удалить GIF: message_id=%s user_id=%s",
+                    thinking.message_id,
+                    user.id,
+                )
+
+    # Отправляем текст только после попытки удалить GIF.
+    try:
+        if error_text:
+            await msg.reply_text(error_text)
+        else:
+            for chunk in chunks:
+                await msg.reply_text(chunk)
+    except Exception:
+        logger.exception("Не удалось отправить ответ ИИ: user_id=%s", user.id)
+
+
+async def cmd_ai(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    user = update.effective_user
+    msg = update.effective_message
+
+    if not user or not msg:
+        return
+
+    text = (msg.text or "").strip()
+    match = _AI_WORD.match(text)
+
+    if not match:
+        return
+
+    prompt = text[match.end():].strip()
+
+    if not prompt:
+        await msg.reply_text(
+            "Формат: <code>Ксю Привет</code> или "
+            "<code>Ксения Как дела?</code>.\n"
+            "1 слово в запросе = 1 токен. "
+            "Токены можно купить в «Магазине».",
+            parse_mode=ParseMode.HTML,
+        )
+        return
+
+    await _run_ai(user, msg, prompt)
+
+
+async def cmd_admin_stats(
+    update: Update,
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    u = update.effective_user
+    msg = update.effective_message
+
+    if not msg:
+        return
+
+    if not ADMIN_ID or not u or u.id != ADMIN_ID:
+        await msg.reply_text("⛔ Только для админа.")
+        return
+
+    await msg.reply_text(
+        "📊 Админ-панель:\n"
+        "• +Шериф / -Шериф @user\n"
+        "• +Комиссар / -Комиссар @user\n"
+        "• Список шерифы / Список комиссары\n"
+        "• Поймать @user (шериф)\n"
+        "• +Мут 5ч Причина / -Мут @user\n"
+        "• +Бан @user / -Бан @user\n"
+        "• +Жалоба / +жб @user\n"
+        "• +Пред / -Пред @user\n"
+        "• +Награда Название / 5 @user\n"
+        "• -Награда Название @user\n"
+        "• Дать леща / Поцеловать / Обнять / Побить / Обоссать / Погладить\n"
+        "• Засос / Расстрел / По шапке / Выстрел / Расцеловать / Сделать 18+\n"
+        "• Пожать руку / Станцевать / Обнять всех / Погладить всех / Лещей всем / Тыкнуть / Защекотать\n"
+        "• Опрос / описание /1/ Вариант1 / Вариант2 (5 мин)\n"
+        "• Опрос ССС / описание /1/ Вариант1 / Вариант2 (5 мин)\n"
+        "• Топ все / Топ день / Топ богачи / Мое место\n"
+        "• Шип @u1 @u2 (с ИИ)\n"
+        "• Сделать предложение / +Брак / -Брак / Мой брак / Топ браки\n"
+        "• /MarriedClean @user\n"
+        "• Профиль\n"
+        "• хо @user 50 — крестики (комиссия 5%)\n"
+        "• +Кредит 50 / -Кредит 50\n"
+        "• Сберкнижка / +Сберкнижка 500 / -Сберкнижка 200\n"
+        "• +Монеты / -Монеты @user\n"
+        "• +Утил / -Утил @user / казна\n"
+        "• Перевод 50 @user\n"
+        "• Казна / +ВКассу 500 / ОбрезатьКасну 15000\n"
+        "• Зарплата\n"
+        "• +ССС / -ССС / Список ССС\n"
+        "• +Суд ССС / +Суд\n"
+        "• дроч / Аура / Топ аура\n"
+        "• Казино монетка/кубик/слоты\n"
+        "• Ксюша / Ксения / Ксю <запрос>\n"
+        "• Правила / Магазин\n"
+        "• -смс\n"
+        "• /Defloult220099\n"
+        "• /ALLMONEY 100\n"
+        "• /restart /help"
+    )
+
+
+async def _cleanup_polls_job(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    try:
+        n = polls.cleanup_expired_polls()
+
+        if n:
+            logger.info("polls cleanup: removed %d", n)
+
+    except Exception as e:
+        logger.warning("polls cleanup: %s", e)
+
+
+async def _post_webhook_startup_job(
+    context: ContextTypes.DEFAULT_TYPE,
+) -> None:
+    """Запускает необязательные долгие подключения после открытия HTTP-порта."""
+    jobs = (
+        ("restore_sss_members", sss.restore_sss_members),
+        ("resolver.start_client", resolver.start_client),
+        ("commands_dop_handlers.sync_to_db", commands_dop_handlers.sync_to_db),
+    )
+    for name, callback in jobs:
+        try:
+            await callback()
+            logger.info("Startup task completed: %s", name)
+        except Exception:
+            # Ошибка вспомогательного сервиса не должна гасить webhook-процесс.
+            logger.exception("Startup task failed: %s", name)
+
+
+async def post_init(app: Application) -> None:
+    # Критичные таблицы готовим до обработки первых обновлений.
+    await db.init_db()
+    await accounts.init_db()
+    await words.init_db()
+    await my_article.init_db()
+    await premium.init_db()
+    await helper.init_db()
+    secretsms.init_db()
+    secretsms.cleanup_expired()
+
+    if app.job_queue:
+        # Долгие внешние подключения/восстановления не задерживают открытие
+        # HTTP-порта Render: они выполняются уже после старта webhook.
+        app.job_queue.run_once(
+            _post_webhook_startup_job,
+            when=2,
+            name="post_webhook_startup",
+        )
+
+        app.job_queue.run_repeating(
+            words.flush_job,
+            interval=30,
+            first=30,
+        )
+
+        app.job_queue.run_daily(
+            top.cleanup_job,
+            time=dtime(hour=0, minute=5, tzinfo=timezone.utc),
+        )
+
+        app.job_queue.run_repeating(
+            top.flush_job,
+            interval=top.FLUSH_INTERVAL_SEC,
+            first=top.FLUSH_INTERVAL_SEC,
+        )
+
+        app.job_queue.run_repeating(
+            _cleanup_polls_job,
+            interval=60,
+            first=60,
+        )
+        app.job_queue.run_repeating(
+            secretsms.cleanup_job,
+            interval=300,
+            first=300,
+        )
+
+        economy.register_jobs(app)
+        app.job_queue.run_repeating(premium.rewards_job, interval=3600, first=30)
+
+    else:
+        logger.warning("JobQueue не инициализирован")
+
+
+async def post_shutdown(app: Application) -> None:
+    for name, callback in (
+        ("top flush", top._flush),
+        ("words flush", words.flush),
+        ("resolver stop", resolver.stop_client),
+        ("AI session close", ai.close_session),
+        ("DB close", db.close_db),
+    ):
+        try:
+            await callback()
+        except Exception:
+            # Не пропускаем закрытие БД из-за ошибки одного из сервисов.
+            logger.exception("Shutdown step failed: %s", name)
+
+    logger.info("Bot stopped")
+
+
+def build_app() -> Application:
+    app = (
+        Application.builder()
+        .token(TOKEN)
+        .request(HTTPXRequest(
+            # Пул рассчитан на ограниченную параллельную обработку обновлений.
+            connection_pool_size=32,
+            connect_timeout=10,
+            read_timeout=60,
+            write_timeout=60,
+            pool_timeout=10,
+        ))
+        # Не даём медленному ИИ/Telegram-запросу остановить обработку всей очереди.
+        # Параллелизм ограничен, чтобы не создавать лавину запросов к БД и Telegram.
+        .concurrent_updates(8)
+        .post_init(post_init)
+        .post_shutdown(post_shutdown)
+        .build()
+    )
+
+    app.add_error_handler(_error_handler)
+
+    # Система аккаунтов: в группах подменяет effective_user на владельца
+    # аккаунта, чтобы баланс/токены/брак/аура и остальные данные были общими
+    # для всех Telegram-сессий. В личных сообщениях подмены нет.
+    app.add_handler(
+        TypeHandler(Update, accounts.identity_middleware),
+        group=-4,
+    )
+
+    # Личный кабинет предложки. Один маршрутизатор в отдельной группе
+    # обрабатывает ВСЕ личные обновления обычных пользователей, включая /start.
+    # Для администратора маршрутизатор возвращает управление штатным командам.
+    async def private_update_router(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+        user = update.effective_user
+        chat = update.effective_chat
+        if chat and chat.type == "private":
+            logger.info(
+                "Private update received: user_id=%s update_id=%s type=%s text=%r",
+                user.id if user else None,
+                update.update_id,
+                "message" if update.effective_message else (
+                    "callback" if update.callback_query else "other"
+                ),
+                (update.effective_message.text or "")[:80]
+                if update.effective_message else None,
+            )
+        try:
+            if await secretsms.handle_private_update(update, context, CHAT_ID):
+                raise ApplicationHandlerStop
+            await helper.handle_private_update(update, context, ADMIN_ID)
+        except ApplicationHandlerStop:
+            # Штатный «стоп» — пробрасываем, чтобы обновление не ушло в другие группы.
+            raise
+        except Exception:
+            logger.exception(
+                "private_update_router: необработанное исключение user_id=%s",
+                user.id if user else None,
+            )
+            msg = update.effective_message
+            if msg:
+                try:
+                    await msg.reply_text(
+                        "⚠️ Временная ошибка. Попробуйте ещё раз через минуту."
+                    )
+                except Exception:
+                    logger.exception(
+                        "private_update_router: fallback-ответ тоже упал"
+                    )
+            raise ApplicationHandlerStop
+
+    app.add_handler(TypeHandler(Update, private_update_router), group=-2)
+
+    # Глобальный фильтр заблокированных пользователей.
+    app.add_handler(
+        TypeHandler(
+            Update,
+            blacklist.guard_blacklisted_update,
+        ),
+        group=-3,
+    )
+
+    app.add_handler(CommandHandler("banbot", blacklist.cmd_banbot))
+    app.add_handler(CommandHandler("unbanbot", blacklist.cmd_unbanbot))
+
+    app.add_handler(CommandHandler("start", cmd_start))
+    app.add_handler(CommandHandler("menu", home_menu.cmd_menu))
+    app.add_handler(CallbackQueryHandler(home_menu.home_callback, pattern=r"^home:"))
+
+    # Аккаунт: в группе — переход в ЛС, в личке — полноценное меню.
+    app.add_handler(MessageHandler(
+        filters.ChatType.GROUPS & filters.Regex(r"(?i)^\+Аккаунт(\s|$)"),
+        accounts.cmd_account_plus,
+    ))
+    app.add_handler(MessageHandler(
+        filters.ChatType.GROUPS & filters.Regex(r"(?i)^[-–−]Аккаунт(\s|$)"),
+        accounts.cmd_account_minus,
+    ))
+    app.add_handler(
+        CallbackQueryHandler(accounts.account_callback, pattern=r"^acc:")
+    )
+    app.add_handler(CallbackQueryHandler(secretsms.read_callback, pattern=r"^secretread:"))
+    app.add_handler(CommandHandler("ping", cmd_ping))
+    app.add_handler(CommandHandler("stats", cmd_admin_stats))
+    app.add_handler(CommandHandler("datarega", cmd_datarega))
+    app.add_handler(CommandHandler("check", pr.recheck_subscription))
+    app.add_handler(CommandHandler("help", help_menu.cmd_help))
+    app.add_handler(
+        CallbackQueryHandler(
+            help_menu.help_callback,
+            pattern=r"^help:",
+        )
+    )
+    app.add_handler(CommandHandler("restart", cmd_restart))
+    app.add_handler(CommandHandler("casino", casino.cmd_casino))
+    app.add_handler(
+        CommandHandler("auraplush", aura_admin.cmd_aura_plush)
+    )
+    app.add_handler(
+        CommandHandler("Defloult220099", economy.cmd_force_default)
+    )
+    app.add_handler(
+        CommandHandler("ALLMONEY", economy.cmd_all_money)
+    )
+    app.add_handler(CommandHandler("GetPremium", premium.admin_command))
+    from telegram.ext import PreCheckoutQueryHandler
+    app.add_handler(PreCheckoutQueryHandler(premium.precheckout))
+    app.add_handler(MessageHandler(filters.SUCCESSFUL_PAYMENT, premium.successful_payment))
+
+    app.add_handler(MessageHandler(
+        filters.Regex(r"^\+Шериф(\s|$)"),
+        roles.grant_sheriff,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"^[-–−]Шериф(\s|$)"),
+        roles.revoke_sheriff,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"^\+Комиссар(\s|$)"),
+        roles.grant_commissar,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"^[-–−]Комиссар(\s|$)"),
+        roles.revoke_commissar,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Список\s+шерифы(\s|$)"),
+        roles.list_sheriffs,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Список\s+комиссары(\s|$)"),
+        roles.list_commissars,
+    ))
+
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Поймать(\s|$)"),
+        roles.sheriff_catch,
+    ))
+    app.add_handler(
+        CallbackQueryHandler(
+            roles.catch_callback,
+            pattern=r"^catch:",
+        )
+    )
+
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^-смс\s*$"),
+        cmd_delete_message,
+    ))
+
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^\+Мут(\s|$)"),
+        roles.mute_user,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^[-–−]Мут(\s|$)"),
+        roles.unmute_user,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^\+Бан(\s|$)"),
+        roles.ban_user,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^[-–−]Бан(\s|$)"),
+        roles.unban_user,
+    ))
+
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Баланс\s*$"),
+        economy.cmd_balance,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Сберкнижка\s*$"),
+        economy.cmd_savings_book,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^\+Сберкнижка(\s|$)"),
+        economy.cmd_savings_deposit,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^[-–−]Сберкнижка(\s|$)"),
+        economy.cmd_savings_withdraw,
+    ))
+
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^\+Кредит(\s|$)"),
+        economy.cmd_credit_take,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^[-–−]Кредит(\s|$)"),
+        economy.cmd_credit_repay,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^\+Монеты(\s|$)"),
+        economy.cmd_admin_coins,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^[-–−]Монеты(\s|$)"),
+        economy.cmd_admin_coins_minus,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Перевод(\s|$)"),
+        economy.cmd_transfer,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Казна(\s|$)"),
+        economy.cmd_treasury,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^\+ВКассу(\s|$)"),
+        economy.cmd_treasury_add,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^ОбрезатьКасну(\s|$)"),
+        economy.cmd_treasury_trim,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Зарплата(\s|$)"),
+        economy.cmd_salary,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Топ\s+богачи(\s|$)"),
+        top.cmd_top_rich,
+    ))
+
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^[-–−]Утил\s+\d+\s+казна(\s|$)"),
+        economy.cmd_burn_treasury,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^[-–−]Утил(\s|$)"),
+        economy.cmd_burn_user,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^\+Утил\s+\d+\s+казна(\s|$)"),
+        economy.cmd_mint_treasury,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^\+Утил(\s|$)"),
+        economy.cmd_mint_user,
+    ))
+
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^казино(\s|$)"),
+        casino.cmd_casino,
+    ))
+    app.add_handler(
+        CallbackQueryHandler(
+            casino.casino_help_callback,
+            pattern=r"^cas:",
+        )
+    )
+
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Топ\s+все(\s|$)"),
+        top.cmd_top_all,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Топ\s+день(\s|$)"),
+        top.cmd_top_day,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Мое\s+место(\s|$)"),
+        top.cmd_my_place,
+    ))
+
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Шип(\s|$)"),
+        ship.cmd_ship,
+    ))
+
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Сделать\s+предложение(\s|$)"),
+        wedding.cmd_propose,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^[-–−]Брак(\s|$)"),
+        wedding.cmd_force_divorce_or_self,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^\+Брак(\s|$)"),
+        wedding.cmd_force_marriage,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Мой\s+брак(\s|$)"),
+        wedding.cmd_marriage_info,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Топ\s+браки(\s|$)"),
+        wedding.cmd_marriage_top,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^/marriedclean(?:@\w+)?(?:\s|$)"),
+        wedding.cmd_married_clean,
+    ))
+    app.add_handler(
+        CallbackQueryHandler(
+            wedding.wedding_callback,
+            pattern=r"^wed:",
+        )
+    )
+
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Репутация(?:\s+.*)?$"),
+        reputation.cmd_reputation,
+    ))
+    app.add_handler(MessageHandler(
+        filters.REPLY & filters.Regex(r"^[+-]$"),
+        reputation.cmd_vote,
+    ))
+
+    # Ежедневная статья УК РФ: только статьи с готовым объяснением.
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^(?:Моя\s+статья|статья)\s*$"),
+        my_article.cmd_my_article,
+    ))
+
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Профиль(\s|$)"),
+        profile.cmd_profile,
+    ))
+    app.add_handler(
+        CallbackQueryHandler(
+            profile.profile_callback,
+            pattern=r"^prof:",
+        )
+    )
+
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^хо(\s|$)"),
+        tictactoe.cmd_challenge,
+    ))
+    app.add_handler(
+        CallbackQueryHandler(
+            tictactoe.ttt_callback,
+            pattern=r"^ttt:",
+        )
+    )
+
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^\+ССС(\s|$)"),
+        sss.cmd_sss_add,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^[-–−]ССС(\s|$)"),
+        sss.cmd_sss_remove,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Список\s+ССС(\s|$)"),
+        sss.cmd_sss_list,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^\+Суд\s+ССС(\s|$)"),
+        sss.cmd_sss_trial,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^\+Суд(\s|$)"),
+        sss.cmd_public_trial,
+    ))
+    app.add_handler(
+        CallbackQueryHandler(
+            sss.sss_trial_callback,
+            pattern=r"^ssstrial:",
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            sss.public_trial_callback,
+            pattern=r"^pubtrial:",
+        )
+    )
+    app.add_handler(
+        CallbackQueryHandler(
+            sss.public_admin_callback,
+            pattern=r"^pubadm:",
+        )
+    )
+
+    app.add_handler(MessageHandler(
+        filters.Regex(rules.RULES_RE),
+        rules.cmd_rules,
+    ))
+
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Опрос\s+ССС(\s|/)"),
+        polls.cmd_poll_sss,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Опрос(?!\s+ССС)(\s|/)"),
+        polls.cmd_poll_public,
+    ))
+    app.add_handler(
+        CallbackQueryHandler(
+            polls.poll_callback,
+            pattern=r"^poll:",
+        )
+    )
+
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^\+(Жалоба|ЖБ|Жал)(\s|$)"),
+        complaints.cmd_complaint,
+    ))
+    app.add_handler(
+        CallbackQueryHandler(
+            complaints.complaint_callback,
+            pattern=r"^compl:",
+        )
+    )
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^\+(Предупреждение|Пред|Варн)(\s|$)"),
+        warns.cmd_warn,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^[-–−](Предупреждение|Пред|Варн)(\s|$)"),
+        warns.cmd_unwarn,
+    ))
+
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^дроч(\s|$)"),
+        aura.cmd_droch,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Топ\s+аура(\s|$)"),
+        aura.cmd_aura_top,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Аура(\s|$)"),
+        aura.cmd_aura,
+    ))
+
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^\+Награда(\s|$)"),
+        awards.cmd_award,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^[-–−]Награда(\s|$)"),
+        awards.cmd_unaward,
+    ))
+
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Дать\s+леща(\s|$)"),
+        actions.cmd_slap,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Поцеловать(\s|$)"),
+        actions.cmd_kiss,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Обнять(\s|$)"),
+        actions.cmd_hug,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Побить(\s|$)"),
+        actions.cmd_hit,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Обоссать(\s|$)"),
+        actions.cmd_piss,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Погладить(\s|$)"),
+        actions.cmd_pat,
+    ))
+
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Засос(\s|$)"),
+        actions.cmd_kiss_deep,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Расстрел(\s|$)"),
+        actions.cmd_shoot,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Дать\s+по\s+шапке(\s|$)"),
+        actions.cmd_bonk,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Выстрел(\s|$)"),
+        actions.cmd_gunshot,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Расцеловать(\s|$)"),
+        actions.cmd_kiss_all,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Сделать\s+18\+?(\s|$)"),
+        actions.cmd_make18,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Станцевать(\s|$)"),
+        actions.cmd_dance,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Обнять\s+всех(\s|$)"),
+        actions.cmd_hug_all,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Погладить\s+всех(\s|$)"),
+        actions.cmd_pat_all,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Лещей\s+всем(\s|$)"),
+        actions.cmd_slap_all,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Тыкнуть(\s|$)"),
+        actions.cmd_poke,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Защекотать(\s|$)"),
+        actions.cmd_tickle,
+    ))
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^(Пожать\s+руку|Рукопожатие)(\s|$)"),
+        actions.cmd_handshake,
+    ))
+
+    # ИИ Ксения — только обращения к Ксюше.
+    # Ответ числом на запрос количества монет в магазине.
+    app.add_handler(MessageHandler(
+        _CoinAmountReplyFilter(),
+        premium.coin_amount_input,
+    ))
+
+    app.add_handler(MessageHandler(
+        filters.Regex(_AI_WORD),
+        cmd_ai,
+    ))
+
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Магазин(\s|$)"),
+        shop.cmd_shop,
+    ))
+    app.add_handler(
+        CallbackQueryHandler(
+            shop.shop_callback,
+            pattern=r"^shop:",
+        )
+    )
+
+    commands_dop_handlers.register(app)
+
+    # МУТ ЗА «АБРАКАДАБРА» — отдельный обработчик, НЕ зависит от pr.py,
+    # подписки на канал и проверок обычных сообщений. Он стоит первым
+    # в группе -1, поэтому для этого точного слова pr.check_and_delete
+    # в той же группе уже не запускается (двойного мута не будет).
+    if CHAT_ID:
+        logger.info("Регистрирую обработчики группы CHAT_ID=%s", CHAT_ID)
+
+        app.add_handler(
+            MessageHandler(
+                filters.Chat(chat_id=CHAT_ID)
+                & filters.TEXT
+                & ~filters.COMMAND
+                & filters.Regex(r"(?i)^\s*абракадабра\s*$"),
+                abrakadabra.check_message,
+            ),
+            group=-1,
+        )
+
+        # Остальные сообщения идут через обычную проверку pr.py.
+        app.add_handler(
+            MessageHandler(
+                filters.Chat(chat_id=CHAT_ID)
+                & ~filters.StatusUpdate.ALL,
+                pr.check_and_delete,
+            ),
+            group=-1,
+        )
+
+    # Сервисное событие о новых участниках не проходит через обычный
+    # обработчик выше из-за исключения StatusUpdate.ALL.
+    app.add_handler(
+        MessageHandler(
+            filters.StatusUpdate.NEW_CHAT_MEMBERS,
+            pr.on_new_member,
+        ),
+        group=-1,
+    )
+
+    # Подсчёт сообщений выполняется позже и не блокирует pr.check_and_delete.
+    if CHAT_ID:
+        app.add_handler(
+            MessageHandler(
+                filters.Chat(chat_id=CHAT_ID)
+                & ~filters.COMMAND
+                & ~filters.StatusUpdate.ALL,
+                top.track_message,
+            ),
+            group=1,
+        )
+
+        # Подсчёт слов — отдельная группа, статистика привязана к аккаунту.
+        app.add_handler(
+            MessageHandler(
+                filters.Chat(chat_id=CHAT_ID)
+                & filters.TEXT
+                & ~filters.StatusUpdate.ALL,
+                words.track_message,
+            ),
+            group=2,
+        )
+
+    return app
+
+
+def main() -> None:
+    if not TOKEN:
+        raise SystemExit("BOT_TOKEN не задан")
+
+    if not WEBHOOK_URL:
+        raise SystemExit("WEBHOOK_URL не задан")
+
+    if not WEBHOOK_URL.startswith("https://"):
+        raise SystemExit("WEBHOOK_URL должен начинаться с https://")
+
+    app = build_app()
+
+    logger.info(
+        "Starting webhook server: port=%s public_url=%s path=/%s "
+        "admin_id_configured=%s chat_id_configured=%s chat_id=%s",
+        PORT, WEBHOOK_URL, WEBHOOK_PATH, bool(ADMIN_ID),
+        bool(CHAT_ID), CHAT_ID,
+    )
+
+    app.run_webhook(
+        listen="0.0.0.0",
+        port=PORT,
+        url_path=WEBHOOK_PATH,
+        webhook_url=f"{WEBHOOK_URL}/{WEBHOOK_PATH}",
+        allowed_updates=Update.ALL_TYPES,
+        drop_pending_updates=False,
+    )
+
+
+if __name__ == "__main__":
+    main()
