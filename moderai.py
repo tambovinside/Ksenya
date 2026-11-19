@@ -57,6 +57,10 @@ ADMIN_MENTION = "@YouWarm"
 
 VIOLATION_THRESHOLD = 5
 
+# Засчитываем нарушение только при высокой уверенности Harmony.
+# Низкая уверенность часто соответствует отдельному мату без оскорбления/травли.
+MIN_TOXIC_SCORE = 0.80
+
 WINDOW_SECONDS = 2 * 60 * 60
 MUTE_SECONDS = 24 * 60 * 60
 
@@ -797,7 +801,19 @@ async def _process_message(
         result.get("latency_ms"),
     )
 
-    if classification != 1:
+    # Не считаем class=1 достаточным основанием: модель может пометить
+    # отдельное ругательство как токсичное без реального оскорбления.
+    # Нарушение засчитывается только при class=1 и уверенности >= порога.
+    if classification != 1 or toxic_score < MIN_TOXIC_SCORE:
+        logger.info(
+            "Harmony ignored as low-confidence/non-violation: "
+            "user=%s message=%s class=%s score=%.2f%% threshold=%.2f%%",
+            message.from_user.id if message.from_user else None,
+            message.message_id,
+            classification,
+            toxic_score * 100,
+            MIN_TOXIC_SCORE * 100,
+        )
         return
 
     if not message.from_user:
