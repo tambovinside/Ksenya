@@ -16,6 +16,7 @@ import db
 import accounts
 import resolver
 import pr
+import moderai
 import roles
 import top
 import words
@@ -522,6 +523,7 @@ async def _post_webhook_startup_job(
 async def post_init(app: Application) -> None:
     # Критичные таблицы готовим до обработки первых обновлений.
     await db.init_db()
+    await moderai.init_db()
     await accounts.init_db()
     await words.init_db()
     await my_article.init_db()
@@ -576,6 +578,7 @@ async def post_init(app: Application) -> None:
 
 async def post_shutdown(app: Application) -> None:
     for name, callback in (
+        ("AI moderation session close", moderai.close),
         ("top flush", top._flush),
         ("words flush", words.flush),
         ("resolver stop", resolver.stop_client),
@@ -612,6 +615,27 @@ def build_app() -> Application:
     )
 
     app.add_error_handler(_error_handler)
+
+    # AI-модерация: отдельная ранняя группа. Она быстро проверяет локальный
+    # фильтр и запускает запрос к Harmony в фоне, не блокируя остальные handlers.
+    if CHAT_ID:
+        app.add_handler(
+            MessageHandler(
+                filters.Chat(chat_id=CHAT_ID)
+                & filters.TEXT
+                & ~filters.COMMAND
+                & ~filters.StatusUpdate.ALL,
+                moderai.check_message,
+            ),
+            group=-5,
+        )
+        app.add_handler(
+            CallbackQueryHandler(
+                moderai.moderation_callback,
+                pattern=r"^modai:",
+            ),
+            group=-5,
+        )
 
     # Система аккаунтов: в группах подменяет effective_user на владельца
     # аккаунта, чтобы баланс/токены/брак/аура и остальные данные были общими
