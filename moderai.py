@@ -3,18 +3,19 @@
 Ksenya AI Security — многоступенчатая AI-модерация Telegram.
 
 Возможности:
-- Каждое текстовое сообщение и подпись проверяются Harmony.
-- Локального фильтра-кандидата нет.
+- Текст и подписи проверяются Harmony с коротким контекстом переписки.
+- Мат и взрослые шутки сами по себе не должны считаться нарушением.
 - Ограниченная очередь сообщений.
 - Один одновременный запрос Harmony, чтобы не перегружать API.
 - Увеличенный таймаут для холодного старта Render и защита от зависших запросов.
 - Сохранение нарушений в Turso.
 - 5 нарушений за 2 часа = мут на 24 часа.
-- Карточки администратору с кнопками.
+- Спокойные служебные карточки отправляются администратору в личные сообщения.
 """
 
 import asyncio
 import html
+from collections import defaultdict, deque
 import logging
 import os
 import secrets
@@ -79,6 +80,14 @@ MAX_QUEUE_SIZE = 250
 # Максимальная длина текста для Harmony.
 MAX_TEXT_LENGTH = 1000
 
+# Сохраняем небольшой контекст последних сообщений группы в памяти процесса.
+# Он передаётся модели вместе с текущим сообщением, чтобы отличать ответную
+# шутку/подкол от направленной травли или эскалации конфликта.
+CONTEXT_MESSAGES = 4
+_recent_messages: dict[int, deque] = defaultdict(
+    lambda: deque(maxlen=CONTEXT_MESSAGES)
+)
+
 # Очередь не позволяет создавать бесконечное количество задач.
 _queue: asyncio.Queue | None = None
 
@@ -98,8 +107,7 @@ _queued_messages: set[tuple[int, int]] = set()
 # MESSAGE PREPARATION
 # ============================================================
 
-# Локального фильтра-кандидата больше нет: каждое текстовое сообщение
-# и каждая подпись к медиа отправляются в Harmony.
+# Проверяем текст и подписи с небольшим контекстом предыдущих сообщений.
 
 
 # ============================================================
@@ -234,8 +242,8 @@ async def _worker_loop() -> None:
         item = await _queue.get()
 
         try:
-            message, bot = item
-            await _process_message(message, bot)
+            message, bot, context_text = item
+            await _process_message(message, bot, context_text)
 
         except asyncio.CancelledError:
             raise
@@ -245,7 +253,7 @@ async def _worker_loop() -> None:
 
         finally:
             if item:
-                message, _ = item
+                message = item[0]
                 _queued_messages.discard(
                     (message.chat_id, message.message_id)
                 )
@@ -481,66 +489,52 @@ async def _notify_admin(
     count: int,
     auto_muted: bool,
     toxic_score: float,
+    message_text: str,
 ) -> None:
+    """Отправляет спокойную служебную карточку только администратору в ЛС."""
+    if not ADMIN_ID:
+        logger.warning("ADMIN_ID не задан: уведомление AI-модерации не отправлено")
+        return
 
-    shown_name = (
-        f"@{username}"
-        if username
-        else (first_name or "Пользователь")
-    )
-
+    shown_name = f"@{username}" if username else (first_name or "Пользователь")
     user_link = (
         f'<a href="tg://user?id={user_id}">'
         f'{html.escape(shown_name)}'
         f'</a>'
     )
-
-    mute_line = (
-        "🔇 Автоматический мут на 24 часа применён."
-        if auto_muted
-        else "⚠️ Мут не применился. Проверьте права бота."
+    excerpt = html.escape((message_text or "")[:700]) or "(пустое сообщение)"
+    status = "Мут на 24 часа применён." if auto_muted else (
+        "Автоматический мут не применился — проверьте права бота."
     )
 
     text = (
-        "⚠️ <b>Ksenya AI Security обнаружила нарушителя</b>\n\n"
-        f"Пользователь: {user_link}\n"
-        f"Нарушений за 2 часа: <b>{count}</b> "
-        f"из {VIOLATION_THRESHOLD}\n"
-        f"Последняя токсичность: "
-        f"<b>{toxic_score * 100:.2f}%</b>\n"
-        "Модель: <code>floxoris/harmony-v1.2</code>\n"
-        f"{mute_line}\n\n"
-        f"Ожидается решение {ADMIN_MENTION}"
+        "<b>Проверка модерации</b>\n"
+        f"Участник: {user_link}\n"
+        f"Нарушений за 2 часа: <b>{count}/{VIOLATION_THRESHOLD}</b>\n"
+        f"Оценка модели: <b>{toxic_score * 100:.1f}%</b>\n"
+        f"{html.escape(status)}\n\n"
+        f"<b>Последнее сообщение:</b>\n<blockquote>{excerpt}</blockquote>"
     )
 
     keyboard = InlineKeyboardMarkup([
-        [
-            InlineKeyboardButton(
-                "❌ Ошибка",
-                callback_data=f"modai:wrong:{alert_id}",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🔨 Бан",
-                callback_data=f"modai:ban:{alert_id}",
-            )
-        ],
-        [
-            InlineKeyboardButton(
-                "🔇 Оставить мут",
-                callback_data=f"modai:mute:{alert_id}",
-            )
-        ],
+        [InlineKeyboardButton("Это ошибка", callback_data=f"modai:wrong:{alert_id}")],
+        [InlineKeyboardButton("Заблокировать", callback_data=f"modai:ban:{alert_id}")],
+        [InlineKeyboardButton("Оставить мут", callback_data=f"modai:mute:{alert_id}")],
     ])
 
-    await bot.send_message(
-        chat_id=chat_id,
-        text=text,
-        parse_mode=ParseMode.HTML,
-        reply_markup=keyboard,
-        disable_web_page_preview=True,
-    )
+    try:
+        await bot.send_message(
+            chat_id=ADMIN_ID,
+            text=text,
+            parse_mode=ParseMode.HTML,
+            reply_markup=keyboard,
+            disable_web_page_preview=True,
+        )
+    except TelegramError:
+        logger.exception(
+            "Не удалось отправить личное уведомление AI-модерации админу=%s",
+            ADMIN_ID,
+        )
 
 
 # ============================================================
@@ -808,6 +802,7 @@ async def _save_violation(
                 count=count,
                 auto_muted=auto_muted,
                 toxic_score=toxic_score,
+                message_text=message_text,
             )
 
         except TelegramError:
@@ -823,6 +818,7 @@ async def _save_violation(
 async def _process_message(
     message,
     bot,
+    context_text: str = "",
 ) -> None:
 
     text = (
@@ -834,7 +830,10 @@ async def _process_message(
     if not text:
         return
 
-    result = await _classify(text)
+    # API-контракт сервера остаётся прежним: передаём один параметр text,
+    # но внутри него есть короткая история и отдельно отмечено текущее сообщение.
+    model_input = context_text or text
+    result = await _classify(model_input)
 
     if not result:
         return
@@ -944,20 +943,40 @@ async def check_message(
     if not API_TOKEN:
         return
 
+    # Защита от повторного обновления одного сообщения.
+    key = (message.chat_id, message.message_id)
+    if key in _queued_messages:
+        return
+
+    # Собираем контекст ДО постановки в очередь: пока медленная модель
+    # обрабатывает прошлое сообщение, следующие уже могут прийти в Telegram.
+    history = _recent_messages[chat.id]
+    current_name = user.full_name or user.username or "Участник"
+    previous_lines = [
+        f"{entry['name']}: {entry['text'][:70]}"
+        for entry in list(history)[-(CONTEXT_MESSAGES - 1):]
+    ]
+    current_line = f"ТЕКУЩЕЕ СООБЩЕНИЕ ({current_name}): {text[:550]}"
+    context_text = (
+        "Оценивай текущее сообщение с учётом переписки. "
+        "Мат, сленг, пошлые шутки, взаимные подколы и обсуждение 18+ "
+        "не являются нарушением сами по себе. Нарушение — направленная "
+        "агрессия, унижение, травля, угрозы или эскалация реального конфликта.\n"
+        + current_line
+        + ("\nПредыдущие сообщения:\n" + "\n".join(previous_lines) if previous_lines else "")
+    )[:MAX_TEXT_LENGTH]
+
+    history.append({"name": current_name, "text": text[:250]})
+
     # Запускаем очередь, если она ещё не запущена.
     if _queue is None or not _workers:
         _start_workers()
-
-    key = (message.chat_id, message.message_id)
-
-    if key in _queued_messages:
-        return
 
     _queued_messages.add(key)
 
     try:
         _queue.put_nowait(
-            (message, context.bot)
+            (message, context.bot, context_text)
         )
 
         logger.debug(
