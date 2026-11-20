@@ -9,7 +9,8 @@ Ksenya AI Security — многоступенчатая AI-модерация Te
 - Один одновременный запрос Harmony, чтобы не перегружать API.
 - Увеличенный таймаут для холодного старта Render и защита от зависших запросов.
 - Сохранение нарушений в Turso.
-- 3 нарушения за 1 час = мут на 24 часа.
+- Реклама/спам = немедленный мут на 24 часа и удаление сообщения.
+- 3 токсичных нарушения за 1 час = мут на 24 часа.
 - Спокойные служебные карточки отправляются администратору в личные сообщения.
 """
 
@@ -68,7 +69,7 @@ VIOLATION_THRESHOLD = 3
 # Засчитываем нарушение только при высокой уверенности Harmony.
 # Низкая уверенность часто соответствует отдельному мату без оскорбления/травли.
 MIN_TOXIC_SCORE = 0.80
-# FastText model: spam probability threshold; configurable in bot environment.
+# FastText: реклама/спам сразу вызывает мут, без накопления нарушений.
 MIN_SPAM_SCORE = float(os.getenv("SPAM_THRESHOLD", "0.90"))
 
 WINDOW_SECONDS = 60 * 60
@@ -215,10 +216,23 @@ async def init_db() -> None:
             status TEXT NOT NULL DEFAULT 'pending',
             auto_muted INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL,
-            muted_until INTEGER
+            muted_until INTEGER,
+            category TEXT NOT NULL DEFAULT 'TOXIC',
+            message_id INTEGER
         )
         """
     )
+
+    alert_columns_rs = await db._exec("PRAGMA table_info(ai_moderation_alerts)")
+    alert_columns = {str(row[1]) for row in (alert_columns_rs.rows or []) if len(row) > 1}
+    if "category" not in alert_columns:
+        await db._exec_required(
+            "ALTER TABLE ai_moderation_alerts ADD COLUMN category TEXT NOT NULL DEFAULT 'TOXIC'"
+        )
+    if "message_id" not in alert_columns:
+        await db._exec_required(
+            "ALTER TABLE ai_moderation_alerts ADD COLUMN message_id INTEGER"
+        )
 
     await db._exec_required(
         """
@@ -476,30 +490,39 @@ async def _classify(text: str) -> dict[str, Any] | None:
 
 
 async def _classify_spam(text: str) -> dict[str, Any] | None:
-    """Проверяет сообщение отдельным FastText endpoint."""
+    """Проверяет исходный текст через FastText endpoint."""
     if not API_TOKEN:
         return None
+
     session = await _get_session()
     headers = {"X-API-Token": API_TOKEN}
     payload = {"text": text[:MAX_TEXT_LENGTH]}
+
     async with _request_semaphore:
         try:
-            async with session.post(SPAM_API_URL, json=payload, headers=headers) as response:
+            async with session.post(
+                SPAM_API_URL,
+                json=payload,
+                headers=headers,
+            ) as response:
                 if response.status != 200:
                     body = (await response.text())[:300]
                     logger.warning("FastText spam HTTP %s: %s", response.status, body)
                     return None
+
                 result = await response.json(content_type=None)
                 if not isinstance(result, dict) or "spam_score" not in result:
                     logger.warning("FastText spam returned invalid JSON: %r", result)
                     return None
                 return result
+
         except asyncio.TimeoutError:
             logger.warning("FastText spam request timeout")
         except (aiohttp.ClientError, ValueError):
             logger.exception("FastText spam request failed")
         except Exception:
             logger.exception("Unexpected FastText spam error")
+
     return None
 
 
@@ -776,7 +799,7 @@ async def _notify_admin(
     message_text: str,
     category: str = "TOXIC",
 ) -> None:
-    """Отправляет спокойную служебную карточку только администратору в ЛС."""
+    """Отправляет карточку с решением администратору в личные сообщения."""
     if not ADMIN_ID:
         logger.warning("ADMIN_ID не задан: уведомление AI-модерации не отправлено")
         return
@@ -792,20 +815,28 @@ async def _notify_admin(
         "Автоматический мут не применился — проверьте права бота."
     )
 
+    is_spam = "SPAM" in category.upper().split("+")
+    if is_spam:
+        details = f"Категория: <b>Реклама / спам</b>\nОценка FastText: <b>{toxic_score * 100:.1f}%</b>\n"
+    else:
+        details = (
+            f"Нарушений за 1 час: <b>{count}/{VIOLATION_THRESHOLD}</b>\n"
+            f"Категория: <b>{html.escape(category)}</b>\n"
+            f"Оценка Harmony: <b>{toxic_score * 100:.1f}%</b>\n"
+        )
+
     text = (
         "<b>Проверка модерации</b>\n"
         f"Участник: {user_link}\n"
-        f"Нарушений за 1 час: <b>{count}/{VIOLATION_THRESHOLD}</b>\n"
-        f"Категория: <b>{html.escape(category)}</b>\n"
-        f"Оценка модели: <b>{toxic_score * 100:.1f}%</b>\n"
+        f"{details}"
         f"{html.escape(status)}\n\n"
         f"<b>Последнее сообщение:</b>\n<blockquote>{excerpt}</blockquote>"
     )
 
     keyboard = InlineKeyboardMarkup([
-        [InlineKeyboardButton("Это ошибка", callback_data=f"modai:wrong:{alert_id}")],
-        [InlineKeyboardButton("Заблокировать", callback_data=f"modai:ban:{alert_id}")],
-        [InlineKeyboardButton("Продлить мут на 24 часа", callback_data=f"modai:mute:{alert_id}")],
+        [InlineKeyboardButton("🚫 Забанить", callback_data=f"modai:ban:{alert_id}")],
+        [InlineKeyboardButton("🔇 Оставить мут на 24 часа", callback_data=f"modai:mute:{alert_id}")],
+        [InlineKeyboardButton("❌ Это ошибка", callback_data=f"modai:wrong:{alert_id}")],
     ])
 
     try:
@@ -903,6 +934,116 @@ async def _save_violation(
                 )
             return
 
+        # Реклама/спам не накапливается: одно подтверждённое срабатывание
+        # немедленно вызывает мут на 24 часа и удаление исходного сообщения.
+        if "SPAM" in category.upper().split("+"):
+            pending_rs = await db._exec(
+                """
+                SELECT alert_id, category, auto_muted, muted_until
+                FROM ai_moderation_alerts
+                WHERE chat_id = ? AND user_id = ? AND status = 'pending'
+                LIMIT 1
+                """,
+                [chat_id, user_id],
+            )
+
+            alert_id = None
+            if pending_rs.rows:
+                old_alert_id, old_category, old_auto_muted, old_muted_until = pending_rs.rows[0]
+                alert_id = str(old_alert_id)
+                # Если открытая карточка была о токсичности, закрываем её как
+                # заменённую, чтобы реклама получила собственную карточку.
+                if "SPAM" not in str(old_category or "").upper().split("+"):
+                    await db._exec(
+                        "UPDATE ai_moderation_alerts SET status = 'superseded' WHERE alert_id = ?",
+                        [alert_id],
+                    )
+                    alert_id = None
+
+            if not alert_id:
+                alert_id = secrets.token_hex(6)
+                created = await db._exec(
+                    """
+                    INSERT INTO ai_moderation_alerts
+                    (alert_id, chat_id, user_id, violation_count, status,
+                     auto_muted, created_at, muted_until, category, message_id)
+                    VALUES (?, ?, ?, 1, 'pending', 0, ?, NULL, 'SPAM', ?)
+                    """,
+                    [alert_id, chat_id, user_id, now, message_id],
+                )
+                if getattr(created, "error", False):
+                    logger.error("Failed to create spam alert user=%s", user_id)
+                    return
+            else:
+                await db._exec(
+                    """
+                    UPDATE ai_moderation_alerts
+                    SET violation_count = 1, category = 'SPAM', message_id = ?
+                    WHERE alert_id = ?
+                    """,
+                    [message_id, alert_id],
+                )
+
+            auto_muted = await _try_mute(bot, chat_id, user_id)
+            muted_until = now + MUTE_SECONDS if auto_muted else None
+            await db._exec(
+                """
+                UPDATE ai_moderation_alerts
+                SET auto_muted = ?, muted_until = ?
+                WHERE alert_id = ?
+                """,
+                [1 if auto_muted else 0, muted_until, alert_id],
+            )
+
+            deleted = False
+            try:
+                await bot.delete_message(chat_id=chat_id, message_id=message_id)
+                deleted = True
+            except TelegramError:
+                logger.exception(
+                    "Could not delete spam message chat=%s message=%s",
+                    chat_id, message_id,
+                )
+
+            user_link = f'<a href="tg://user?id={user_id}">Участник</a>'
+            if auto_muted:
+                group_text = f"🔇 {user_link} получил мут на 24 часа за рекламу или спам."
+            else:
+                group_text = (
+                    f"⚠️ У {user_link} обнаружена реклама или спам, "
+                    "но автоматический мут не применился. Администратор уведомлён."
+                )
+            if not deleted:
+                group_text += "\nНе удалось удалить рекламное сообщение — проверьте права бота."
+            try:
+                await bot.send_message(
+                    chat_id=chat_id,
+                    text=group_text,
+                    parse_mode=ParseMode.HTML,
+                    disable_web_page_preview=True,
+                )
+            except TelegramError:
+                logger.exception("Could not send spam notice to group=%s", chat_id)
+
+            await _notify_admin(
+                bot,
+                alert_id=alert_id,
+                chat_id=chat_id,
+                user_id=user_id,
+                first_name=first_name,
+                username=username,
+                count=1,
+                auto_muted=auto_muted,
+                toxic_score=toxic_score,
+                message_text=message_text,
+                category="SPAM",
+            )
+            logger.warning(
+                "SPAM ACTION: user=%s muted=%s deleted=%s score=%.2f%%",
+                user_id, auto_muted, deleted, toxic_score * 100,
+            )
+            return
+
         # Удаляем старые нарушения.
         await db._exec(
             """
@@ -919,6 +1060,7 @@ async def _save_violation(
             WHERE chat_id = ?
               AND user_id = ?
               AND created_at >= ?
+              AND (category LIKE '%TOXIC%' OR category LIKE '%NSFL%' OR category LIKE '%NSFW%')
             """,
             [chat_id, user_id, cutoff],
         )
@@ -948,7 +1090,7 @@ async def _save_violation(
         # применён или уже истёк, пробуем применить его повторно.
         pending_rs = await db._exec(
             """
-            SELECT alert_id, auto_muted, muted_until
+            SELECT alert_id, auto_muted, muted_until, category
             FROM ai_moderation_alerts
             WHERE chat_id = ?
               AND user_id = ?
@@ -966,7 +1108,20 @@ async def _save_violation(
             return
 
         if pending_rs.rows:
-            existing_alert_id, was_auto_muted, old_muted_until = pending_rs.rows[0]
+            existing_alert_id, was_auto_muted, old_muted_until, existing_category = pending_rs.rows[0]
+            was_auto_muted = int(was_auto_muted or 0)
+            old_muted_until = int(old_muted_until or 0)
+
+            # Не смешиваем карточку рекламы с карточкой токсичности.
+            if "SPAM" in str(existing_category or "").upper().split("+"):
+                await db._exec(
+                    "UPDATE ai_moderation_alerts SET status = 'superseded' WHERE alert_id = ?",
+                    [existing_alert_id],
+                )
+                pending_rs = None
+
+        if pending_rs is not None and pending_rs.rows:
+            existing_alert_id, was_auto_muted, old_muted_until, existing_category = pending_rs.rows[0]
             was_auto_muted = int(was_auto_muted or 0)
             old_muted_until = int(old_muted_until or 0)
 
@@ -991,12 +1146,15 @@ async def _save_violation(
                         UPDATE ai_moderation_alerts
                         SET violation_count = ?,
                             auto_muted = 1,
-                            muted_until = ?
+                            muted_until = ?,
+                            category = ?, message_id = ?
                         WHERE alert_id = ?
                         """,
                         [
                             count,
                             muted_until,
+                            category,
+                            message_id,
                             existing_alert_id,
                         ],
                     )
@@ -1022,11 +1180,14 @@ async def _save_violation(
                         UPDATE ai_moderation_alerts
                         SET violation_count = ?,
                             auto_muted = 0,
-                            muted_until = NULL
+                            muted_until = NULL,
+                            category = ?, message_id = ?
                         WHERE alert_id = ?
                         """,
                         [
                             count,
+                            category,
+                            message_id,
                             existing_alert_id,
                         ],
                     )
@@ -1039,11 +1200,13 @@ async def _save_violation(
                 await db._exec(
                     """
                     UPDATE ai_moderation_alerts
-                    SET violation_count = ?
+                    SET violation_count = ?, category = ?, message_id = ?
                     WHERE alert_id = ?
                     """,
                     [
                         count,
+                        category,
+                        message_id,
                         existing_alert_id,
                     ],
                 )
@@ -1063,9 +1226,11 @@ async def _save_violation(
                 status,
                 auto_muted,
                 created_at,
-                muted_until
+                muted_until,
+                category,
+                message_id
             )
-            VALUES (?, ?, ?, ?, 'pending', 0, ?, NULL)
+            VALUES (?, ?, ?, ?, 'pending', 0, ?, NULL, ?, ?)
             """,
             [
                 alert_id,
@@ -1073,6 +1238,8 @@ async def _save_violation(
                 user_id,
                 count,
                 now,
+                category,
+                message_id,
             ],
         )
 
@@ -1135,7 +1302,6 @@ async def _save_violation(
                 auto_muted=auto_muted,
                 toxic_score=toxic_score,
                 message_text=message_text,
-                category=category,
             )
 
         except TelegramError:
@@ -1157,8 +1323,6 @@ async def _process_message(
     if not text or not message.from_user:
         return
 
-    # Toxicity receives conversation context; spam classifier receives the
-    # original message only. Both results are evaluated independently.
     model_input = context_text or text
     toxic_result, spam_result = await asyncio.gather(
         _classify(model_input),
@@ -1173,7 +1337,7 @@ async def _process_message(
         try:
             classification = int(toxic_result.get("class", 0))
             toxic_score = _parse_score(toxic_result.get("toxic_score", 0))
-            if classification in (0, 1) and classification == 1 and toxic_score >= MIN_TOXIC_SCORE:
+            if classification == 1 and toxic_score >= MIN_TOXIC_SCORE:
                 categories.append("TOXIC")
                 scores.append(toxic_score)
             logger.info(
@@ -1225,7 +1389,7 @@ async def check_message(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     """
-    Каждое текстовое сообщение и подпись отправляются в общую очередь AI-модерации.
+    Каждое текстовое сообщение и подпись отправляются в очередь Harmony.
     Команды также проверяются, если они попадают в этот handler.
     """
 
@@ -1593,7 +1757,7 @@ async def moderation_callback(
 
     rs = await db._exec(
         """
-        SELECT chat_id, user_id, status, auto_muted
+        SELECT chat_id, user_id, status, auto_muted, category, message_id
         FROM ai_moderation_alerts
         WHERE alert_id = ?
         LIMIT 1
@@ -1611,7 +1775,7 @@ async def moderation_callback(
         )
         return
 
-    chat_id, user_id, status, auto_muted = rs.rows[0]
+    chat_id, user_id, status, auto_muted, alert_category, alert_message_id = rs.rows[0]
 
     chat_id = int(chat_id)
     user_id = int(user_id)
@@ -1629,7 +1793,7 @@ async def moderation_callback(
         # Повторно проверяем статус под блокировкой.
         current = await db._exec(
             """
-            SELECT status, auto_muted
+            SELECT status, auto_muted, category, message_id
             FROM ai_moderation_alerts
             WHERE alert_id = ?
             LIMIT 1
@@ -1645,30 +1809,47 @@ async def moderation_callback(
             return
 
         auto_muted = int(current.rows[0][1] or 0)
+        alert_category = str(current.rows[0][2] or "TOXIC").upper()
+        alert_message_id = current.rows[0][3]
 
         try:
             if action == "wrong":
 
-                if auto_muted:
-                    await context.bot.restrict_chat_member(
-                        chat_id=chat_id,
-                        user_id=user_id,
-                        permissions=_permissions_unmuted(),
+                if "SPAM" in alert_category.split("+") and alert_message_id is not None:
+                    await db._exec(
+                        "DELETE FROM ai_moderation_violations WHERE chat_id = ? AND message_id = ?",
+                        [chat_id, int(alert_message_id)],
                     )
-
-                await db._exec(
-                    """
-                    DELETE FROM ai_moderation_violations
-                    WHERE chat_id = ?
-                      AND user_id = ?
-                      AND created_at >= ?
-                    """,
-                    [
-                        chat_id,
-                        user_id,
-                        int(time.time()) - WINDOW_SECONDS,
-                    ],
-                )
+                    remaining_toxic = await db._exec(
+                        """
+                        SELECT COUNT(*) FROM ai_moderation_violations
+                        WHERE chat_id = ? AND user_id = ? AND created_at >= ?
+                          AND (category LIKE '%TOXIC%' OR category LIKE '%NSFL%' OR category LIKE '%NSFW%')
+                        """,
+                        [chat_id, user_id, int(time.time()) - WINDOW_SECONDS],
+                    )
+                    # Если одновременно накоплено 3 токсичных нарушения,
+                    # не снимаем мут, несмотря на отмену спам-срабатывания.
+                    if auto_muted and (not remaining_toxic.rows or int(remaining_toxic.rows[0][0] or 0) < VIOLATION_THRESHOLD):
+                        await context.bot.restrict_chat_member(
+                            chat_id=chat_id,
+                            user_id=user_id,
+                            permissions=_permissions_unmuted(),
+                        )
+                else:
+                    if auto_muted:
+                        await context.bot.restrict_chat_member(
+                            chat_id=chat_id,
+                            user_id=user_id,
+                            permissions=_permissions_unmuted(),
+                        )
+                    await db._exec(
+                        """
+                        DELETE FROM ai_moderation_violations
+                        WHERE chat_id = ? AND user_id = ? AND created_at >= ?
+                        """,
+                        [chat_id, user_id, int(time.time()) - WINDOW_SECONDS],
+                    )
 
                 await db._exec(
                     """
@@ -1681,7 +1862,7 @@ async def moderation_callback(
 
                 result_text = (
                     "❌ Администратор отменил срабатывание. "
-                    "Нарушения за последний час очищены."
+                    + ("Удалено только это спам-срабатывание." if "SPAM" in alert_category.split("+") else "Нарушения за последний час очищены.")
                 )
 
             elif action == "ban":
