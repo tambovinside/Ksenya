@@ -51,10 +51,12 @@ _spam_env = os.getenv("SPAM_THRESHOLD")
 MIN_SPAM_SCORE = float(_spam_env or "0.92")
 
 _media_env = os.getenv("MEDIA_THRESHOLD")
-MIN_MEDIA_SCORE = float(_media_env or "0.95")
+MIN_MEDIA_SCORE = float(_media_env or "0.88")
 
 _media_nsfl_env = os.getenv("MEDIA_NSFL_THRESHOLD")
-MIN_MEDIA_NSFL_SCORE = float(_media_nsfl_env or "0.85")
+MIN_MEDIA_NSFL_SCORE = float(_media_nsfl_env or "0.82")
+
+MEDIA_CONFIRM_SCORE = 0.85
 
 WINDOW_SECONDS = 30 * 60
 MUTE_SECONDS = 24 * 60 * 60
@@ -117,12 +119,9 @@ _TOXIC_REGEX = [re.compile(p, re.IGNORECASE) for p in _TOXIC_PATTERNS]
 _SAFE_CONTEXT_PATTERNS = [
     r"\b(пляж|пляжный|пляже|пляжем|beach|pool|бассейн|бассейне)\b",
     r"\b(купальник|купальнике|купальники|плавки|плавках|бикини|bikini|swimwear)\b",
-    r"\b(спорт|спортивный|спортзал|тренажёрк|тренажерк|фитнес|fitness|gym)\b",
-    r"\b(баскетбол|футбол|волейбол|теннис|бокс|борьб|mma|ufc)\b",
-    r"\b(манекен|манекенщиц|модель|подиум|fashion|мода|показ)\b",
+    r"\b(плавание|плаванье|swim|swimming|аквапарк|waterpark)\b",
     r"\b(нижнее\s+бельё|белье|трусы|трусики|bra|underwear|lingerie)\b",
-    r"\b(врач|медицин|медик|клиник|больниц|surgery|хирург)\b",
-    r"\b(дети|ребёнок|ребенок|малыш|младенец|детск)\b",
+    r"\b(манекен|манекенщиц|модель|подиум|fashion|мода|показ)\b",
 ]
 _SAFE_CONTEXT_REGEX = [re.compile(p, re.IGNORECASE) for p in _SAFE_CONTEXT_PATTERNS]
 
@@ -347,9 +346,9 @@ async def init_db() -> None:
         if _spam_env:
             logger.info("SPAM_THRESHOLD env=%s overrides default 0.92", _spam_env)
         if _media_env:
-            logger.info("MEDIA_THRESHOLD env=%s overrides default 0.95", _media_env)
+            logger.info("MEDIA_THRESHOLD env=%s overrides default 0.88", _media_env)
         if _media_nsfl_env:
-            logger.info("MEDIA_NSFL_THRESHOLD env=%s overrides default 0.85", _media_nsfl_env)
+            logger.info("MEDIA_NSFL_THRESHOLD env=%s overrides default 0.82", _media_nsfl_env)
         logger.info(
             "Ksenya AI Security initialized: chat=%s threshold=%s window=%s "
             "workers=%s toxic=%s spam=%s media=%s nsfl=%s heuristics=on",
@@ -530,7 +529,13 @@ _IMAGE_LABEL_ALIASES = {
     "NUDITY": "NSFW",
     "NUDE": "NSFW",
     "SEXUAL": "NSFW",
+    "SEX": "NSFW",
     "XXX": "NSFW",
+    "TOPLESS": "NSFW",
+    "BOTTOMLESS": "NSFW",
+    "NIPPLE": "NSFW",
+    "GENITAL": "NSFW",
+    "GENITALS": "NSFW",
     "GORE": "NSFL",
     "VIOLENCE": "NSFL",
     "SHOCK": "NSFL",
@@ -549,12 +554,25 @@ _SAFE_IMAGE_LABELS = {
     "SWIMWEAR",
     "UNDERWEAR",
     "LINGERIE",
-    "BATHING_SUIT",
     "BIKINI",
-    "BEACH",
-    "SPORT",
-    "FITNESS",
-    "GYM",
+    "BATHING_SUIT",
+}
+
+_HARD_NSFW_LABELS = {
+    "NSFW",
+    "EXPLICIT",
+    "PORN",
+    "PORNOGRAPHY",
+    "NUDITY",
+    "NUDE",
+    "SEXUAL",
+    "SEX",
+    "XXX",
+    "TOPLESS",
+    "BOTTOMLESS",
+    "NIPPLE",
+    "GENITAL",
+    "GENITALS",
 }
 
 
@@ -1602,12 +1620,6 @@ async def _process_media_message(message, bot) -> None:
         return
 
     caption = (message.caption or "").strip()
-    if _has_safe_context(caption):
-        logger.info(
-            "Image moderation skipped by caption context: user=%s message=%s caption=%r",
-            message.from_user.id, message.message_id, caption[:200],
-        )
-        return
 
     result = await _classify_images(images)
     if not result:
@@ -1617,16 +1629,35 @@ async def _process_media_message(message, bot) -> None:
     detected: set[str] = set()
     category_scores: dict[str, float] = {"NSFL": 0.0, "NSFW": 0.0}
     per_label_hits: dict[str, int] = {"NSFL": 0, "NSFW": 0}
+    hard_confirm = False
+    safe_label_hit = False
     raw_labels: list[str] = []
 
     for item in items:
-        label = _extract_item_label(item)
-        scores = _extract_item_scores(item)
-        if label:
-            raw_labels.append(label)
+        raw_label = ""
+        for key in ("label", "class", "category", "prediction", "top_label", "predicted_label", "name"):
+            val = item.get(key)
+            if isinstance(val, str) and val.strip():
+                raw_label = val.strip().upper()
+                break
+        if not raw_label:
+            labels = item.get("labels") or item.get("classes") or item.get("categories")
+            if isinstance(labels, list) and labels:
+                first = labels[0]
+                if isinstance(first, str):
+                    raw_label = first.strip().upper()
+                elif isinstance(first, dict):
+                    raw_label = str(first.get("label") or first.get("name") or "").strip().upper()
+        if raw_label:
+            raw_labels.append(raw_label)
 
-        if label in _SAFE_IMAGE_LABELS:
-            continue
+        if raw_label in _HARD_NSFW_LABELS:
+            hard_confirm = True
+        if raw_label in _SAFE_IMAGE_LABELS:
+            safe_label_hit = True
+
+        label = _normalize_media_label(raw_label)
+        scores = _extract_item_scores(item)
 
         for candidate in ("NSFL", "NSFW"):
             raw = scores.get(candidate, scores.get(candidate.lower(), 0))
@@ -1637,7 +1668,8 @@ async def _process_media_message(message, bot) -> None:
             if score > 1:
                 score /= 100
             category_scores[candidate] = max(category_scores[candidate], score)
-            if score >= (MIN_MEDIA_NSFL_SCORE if candidate == "NSFL" else MIN_MEDIA_SCORE):
+            threshold = MIN_MEDIA_NSFL_SCORE if candidate == "NSFL" else MIN_MEDIA_SCORE
+            if score >= threshold:
                 per_label_hits[candidate] += 1
 
         if label in ("NSFL", "NSFW"):
@@ -1645,13 +1677,29 @@ async def _process_media_message(message, bot) -> None:
             if category_scores[label] >= threshold:
                 detected.add(label)
 
-    if "NSFL" in detected and category_scores["NSFL"] >= MIN_MEDIA_NSFL_SCORE:
+    if category_scores["NSFL"] >= MIN_MEDIA_NSFL_SCORE:
         detected.add("NSFL")
-
-    if "NSFW" in detected and category_scores["NSFW"] >= MIN_MEDIA_SCORE:
+    if category_scores["NSFW"] >= MIN_MEDIA_SCORE:
         detected.add("NSFW")
 
-    if len(images) >= 3 and "NSFW" in detected and per_label_hits["NSFW"] < 2:
+    if hard_confirm and category_scores["NSFW"] >= MEDIA_CONFIRM_SCORE:
+        detected.add("NSFW")
+
+    if "NSFW" in detected and safe_label_hit and not hard_confirm:
+        logger.info(
+            "NSFW suppressed (safe label present, no hard confirm): user=%s message=%s labels=%s",
+            message.from_user.id, message.message_id, raw_labels[:5],
+        )
+        detected.discard("NSFW")
+
+    if "NSFW" in detected and _has_safe_context(caption) and not hard_confirm:
+        logger.info(
+            "NSFW suppressed by caption context: user=%s message=%s caption=%r labels=%s",
+            message.from_user.id, message.message_id, caption[:200], raw_labels[:5],
+        )
+        detected.discard("NSFW")
+
+    if len(images) >= 3 and "NSFW" in detected and per_label_hits["NSFW"] < 2 and not hard_confirm:
         logger.info(
             "NSFW suppressed (only %s/%s frames flagged): user=%s message=%s labels=%s",
             per_label_hits["NSFW"], len(images),
