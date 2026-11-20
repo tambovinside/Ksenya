@@ -174,10 +174,24 @@ async def init_db() -> None:
             message_text TEXT,
             toxic_score REAL,
             created_at INTEGER NOT NULL,
+            category TEXT NOT NULL DEFAULT 'TOXIC',
+            media_type TEXT,
             UNIQUE(chat_id, message_id)
         )
         """
     )
+
+    # Миграция уже существующей таблицы без потери старых нарушений.
+    columns_rs = await db._exec("PRAGMA table_info(ai_moderation_violations)")
+    existing_columns = {str(row[1]) for row in (columns_rs.rows or []) if len(row) > 1}
+    if "category" not in existing_columns:
+        await db._exec_required(
+            "ALTER TABLE ai_moderation_violations ADD COLUMN category TEXT NOT NULL DEFAULT 'TOXIC'"
+        )
+    if "media_type" not in existing_columns:
+        await db._exec_required(
+            "ALTER TABLE ai_moderation_violations ADD COLUMN media_type TEXT"
+        )
 
     await db._exec_required(
         """
@@ -515,61 +529,12 @@ async def _try_mute(
     chat_id: int,
     user_id: int,
 ) -> bool:
-    """Надёжно ограничивает участника на 24 часа.
+    """Применяет мут одним основным запросом без предварительных сетевых проверок.
 
-    Сначала проверяет права бота и статус участника, затем повторяет
-    временные сетевые ошибки и ответы Telegram с retry_after.
-    Постоянные ошибки (например, отсутствие прав или попытка ограничить
-    администратора) не маскируются повторными запросами.
+    Это не задерживает модерацию двумя дополнительными get_chat_member.
+    Временные сетевые ошибки и RetryAfter повторяются до трёх раз.
     """
     until = datetime.now(timezone.utc) + timedelta(seconds=MUTE_SECONDS)
-
-    # Предварительная проверка прав бота. Если Telegram временно не даёт
-    # получить сведения, всё равно пробуем сам restrict_chat_member ниже:
-    # именно его ответ является окончательным.
-    try:
-        bot_member = await bot.get_chat_member(chat_id=chat_id, user_id=bot.id)
-        bot_status = str(getattr(bot_member, "status", ""))
-        can_restrict = getattr(bot_member, "can_restrict_members", None)
-        if bot_status not in ("administrator", "creator"):
-            logger.error(
-                "Mute impossible: bot is not an administrator | chat=%s bot_status=%s user=%s",
-                chat_id, bot_status, user_id,
-            )
-            return False
-        if can_restrict is False:
-            logger.error(
-                "Mute impossible: bot lacks restrict_members permission | chat=%s user=%s",
-                chat_id, user_id,
-            )
-            return False
-    except TelegramError:
-        logger.warning(
-            "Could not pre-check bot permissions; trying restrict_chat_member | chat=%s user=%s",
-            chat_id, user_id, exc_info=True,
-        )
-
-    # Telegram не разрешает ботам ограничивать создателя и администраторов.
-    try:
-        target = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
-        target_status = str(getattr(target, "status", ""))
-        if target_status in ("administrator", "creator"):
-            logger.warning(
-                "Mute skipped: target is a chat administrator | chat=%s user=%s status=%s",
-                chat_id, user_id, target_status,
-            )
-            return False
-        if target_status in ("left", "kicked"):
-            logger.warning(
-                "Mute skipped: target is not an active member | chat=%s user=%s status=%s",
-                chat_id, user_id, target_status,
-            )
-            return False
-    except TelegramError:
-        logger.warning(
-            "Could not pre-check target status; trying restrict_chat_member | chat=%s user=%s",
-            chat_id, user_id, exc_info=True,
-        )
 
     for attempt in range(1, 4):
         try:
@@ -604,10 +569,8 @@ async def _try_mute(
                 chat_id, user_id, attempt, error_name, error,
                 exc_info=True,
             )
-
             if not is_temporary or attempt >= 3:
                 return False
-
             delay = float(retry_after) if retry_after is not None else min(2 ** (attempt - 1), 5)
             await asyncio.sleep(max(0.5, min(delay, 30)))
 
@@ -621,7 +584,6 @@ async def _try_mute(
             await asyncio.sleep(min(2 ** (attempt - 1), 5))
 
     return False
-
 
 # ============================================================
 # CONFIRMED CONTENT REMOVAL + GROUP NOTICE
@@ -645,6 +607,7 @@ async def _delete_confirmed_violations(
         WHERE chat_id = ?
           AND user_id = ?
           AND created_at >= ?
+          AND media_type IN ('photo', 'sticker', 'video')
         ORDER BY created_at DESC
         """,
         [chat_id, user_id, cutoff],
@@ -688,6 +651,30 @@ async def _delete_confirmed_violations(
     return deleted, failed
 
 
+async def _get_violation_reason(chat_id: int, user_id: int) -> str:
+    rs = await db._exec(
+        """
+        SELECT DISTINCT category
+        FROM ai_moderation_violations
+        WHERE chat_id = ? AND user_id = ? AND created_at >= ?
+        """,
+        [chat_id, user_id, int(time.time()) - WINDOW_SECONDS],
+    )
+    categories = {
+        part
+        for row in (rs.rows or []) if row and row[0]
+        for part in str(row[0]).upper().split("+")
+    }
+    labels = []
+    if "NSFL" in categories:
+        labels.append("NSFL — шокирующий контент и жестокость")
+    if "NSFW" in categories:
+        labels.append("NSFW — сексуальный контент или нагота")
+    if "TOXIC" in categories:
+        labels.append("оскорбления или травля")
+    return "; ".join(labels) if labels else "нарушение правил сообщества"
+
+
 async def _notify_group_action(
     bot,
     *,
@@ -696,21 +683,22 @@ async def _notify_group_action(
     action: str,
     deleted: int,
     failed: int,
+    reason: str,
 ) -> None:
-    """Публично сообщает группе о решении администратора без цитирования контента."""
+    """Публично сообщает группе о подтверждённом решении администратора."""
     user_link = f'<a href="tg://user?id={user_id}">Участник</a>'
 
     if action == "ban":
-        heading = f"🚫 {user_link} заблокирован за запрещённый контент."
+        heading = f"🚫 {user_link} заблокирован. Причина: {html.escape(reason)}."
     else:
-        heading = f"🔇 {user_link} получил мут на 24 часа за запрещённый контент."
+        heading = f"🔇 {user_link} получил мут на 24 часа. Причина: {html.escape(reason)}."
 
     if deleted and not failed:
-        cleanup = f"Удалено сообщений с нарушениями: {deleted}."
+        cleanup = f"Удалено медиа-сообщений с нарушениями: {deleted}."
     elif deleted and failed:
         cleanup = (
             f"Удалось удалить сообщений: {deleted}; "
-            f"не удалось удалить: {failed}."
+            f"не удалось удалить медиа-сообщений: {failed}."
         )
     elif failed:
         cleanup = (
@@ -779,7 +767,7 @@ async def _notify_admin(
     keyboard = InlineKeyboardMarkup([
         [InlineKeyboardButton("Это ошибка", callback_data=f"modai:wrong:{alert_id}")],
         [InlineKeyboardButton("Заблокировать", callback_data=f"modai:ban:{alert_id}")],
-        [InlineKeyboardButton("Оставить мут", callback_data=f"modai:mute:{alert_id}")],
+        [InlineKeyboardButton("Продлить мут на 24 часа", callback_data=f"modai:mute:{alert_id}")],
     ])
 
     try:
@@ -811,6 +799,8 @@ async def _save_violation(
     toxic_score: float,
     first_name: str,
     username: str | None,
+    category: str = "TOXIC",
+    media_type: str | None = None,
 ) -> None:
 
     now = int(time.time())
@@ -829,9 +819,11 @@ async def _save_violation(
                 message_id,
                 message_text,
                 toxic_score,
-                created_at
+                created_at,
+                category,
+                media_type
             )
-            VALUES (?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?)
             """,
             [
                 chat_id,
@@ -840,6 +832,8 @@ async def _save_violation(
                 message_text[:MAX_TEXT_LENGTH],
                 toxic_score,
                 now,
+                category,
+                media_type,
             ],
         )
 
@@ -853,6 +847,22 @@ async def _save_violation(
         if int(
             getattr(inserted, "rows_affected", 0) or 0
         ) == 0:
+            # Подпись к фото/видео может быть отдельно обработана текстовым
+            # обработчиком раньше медиа-воркера. Не считаем одно сообщение
+            # вторым нарушением, но обязательно помечаем его как медиа для
+            # последующего удаления после подтверждения администратором.
+            if media_type in ("photo", "sticker", "video"):
+                await db._exec(
+                    """
+                    UPDATE ai_moderation_violations
+                    SET media_type = ?,
+                        category = CASE WHEN category = 'TOXIC' THEN ? ELSE category END,
+                        message_text = ?,
+                        toxic_score = MAX(toxic_score, ?)
+                    WHERE chat_id = ? AND message_id = ?
+                    """,
+                    [media_type, category, message_text[:MAX_TEXT_LENGTH], toxic_score, chat_id, message_id],
+                )
             return
 
         # Удаляем старые нарушения.
@@ -1324,15 +1334,15 @@ def _render_tgs(raw: bytes) -> bytes:
 
 
 def _video_frames(raw: bytes) -> list[tuple[str, bytes]]:
-    """Извлекает пять кадров видео: начало, 25%, 50%, 75%, конец."""
+    """Быстро извлекает до трёх равномерно распределённых кадров видео."""
     import imageio_ffmpeg
     ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
     with tempfile.TemporaryDirectory(prefix="modai_video_") as folder:
-        source = Path(folder) / "source_video"
+        source = Path(folder) / "source_video.mp4"
         source.write_bytes(raw)
         probe = subprocess.run(
             [ffmpeg, "-hide_banner", "-i", str(source)],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20, check=False,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15, check=False,
         )
         details = probe.stderr.decode("utf-8", errors="ignore")
         match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", details)
@@ -1341,17 +1351,19 @@ def _video_frames(raw: bytes) -> list[tuple[str, bytes]]:
         duration = int(match.group(1)) * 3600 + int(match.group(2)) * 60 + float(match.group(3))
         if duration <= 0:
             raise RuntimeError("Видео имеет некорректную длительность")
-        times = [min(0.1, duration / 10), duration * 0.25, duration * 0.5, duration * 0.75, max(0, duration - 0.1)]
+        fps = 3.0 / max(duration, 0.5)
+        pattern = str(Path(folder) / "frame_%02d.jpg")
+        subprocess.run(
+            [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-i", str(source),
+             "-vf", f"fps={fps:.6f},scale=512:512:force_original_aspect_ratio=decrease",
+             "-frames:v", "3", "-q:v", "4", pattern],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=25, check=True,
+        )
         frames = []
-        for index, timestamp in enumerate(times, start=1):
-            output = Path(folder) / f"frame_{index}.jpg"
-            subprocess.run(
-                [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{timestamp:.3f}",
-                 "-i", str(source), "-frames:v", "1", "-vf",
-                 "scale=512:512:force_original_aspect_ratio=decrease", "-q:v", "4", str(output)],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15, check=True,
-            )
-            frames.append((f"frame_{index}.jpg", _compress_image_bytes(output.read_bytes())))
+        for output in sorted(Path(folder).glob("frame_*.jpg")):
+            frames.append((output.name, _compress_image_bytes(output.read_bytes())))
+        if not frames:
+            raise RuntimeError("Не удалось извлечь кадры видео")
         return frames
 
 
@@ -1406,38 +1418,64 @@ async def _process_media_message(message, bot) -> None:
     result = await _classify_images(images)
     if not result:
         return
+
     items = result.get("results") or result.get("images") or []
-    is_violation = bool(result.get("violation"))
-    nsfw_score = 0.0
+    detected_categories: set[str] = set()
+    category_scores: dict[str, float] = {"NSFL": 0.0, "NSFW": 0.0}
     for item in items:
         if not isinstance(item, dict):
             continue
         label = str(item.get("label", "")).upper()
         scores = item.get("scores") or {}
-        try:
-            score = float(scores.get("NSFW", scores.get("nsfw", item.get("nsfw_score", 0))) or 0)
-            if score > 1:
-                score /= 100
-        except (TypeError, ValueError):
-            score = 0.0
-        nsfw_score = max(nsfw_score, score)
-        if label == "NSFW" or item.get("violation") is True:
-            is_violation = True
-    if not is_violation:
-        logger.info("Image moderation safe: user=%s message=%s frames=%s", message.from_user.id, message.message_id, len(images))
+        for candidate in ("NSFL", "NSFW"):
+            try:
+                score = float(scores.get(candidate, scores.get(candidate.lower(), 0)) or 0)
+                if score > 1:
+                    score /= 100
+            except (TypeError, ValueError):
+                score = 0.0
+            category_scores[candidate] = max(category_scores[candidate], score)
+        if label in ("NSFL", "NSFW") or item.get("violation") is True:
+            detected_categories.add(label if label in ("NSFL", "NSFW") else "NSFW")
+
+    # Совместимость с сервером, который возвращает общий флаг violation.
+    if result.get("violation") and not detected_categories:
+        detected_categories.add("NSFW")
+
+    if not detected_categories:
+        logger.info(
+            "Image moderation safe: user=%s message=%s frames=%s",
+            message.from_user.id, message.message_id, len(images),
+        )
         return
-    excerpt = f"{media_name}: обнаружен NSFW-контент"
+
+    # Если модель нашла обе категории, сохраняем более тяжёлую как основную,
+    # но reason summary покажет обе категории из таблицы.
+    category = "+".join(sorted(detected_categories))
+    score = max((category_scores.get(item, 0.0) for item in detected_categories), default=0.0)
+    if score <= 0:
+        score = 0.99
+    media_type = "photo" if message.photo else ("sticker" if message.sticker else "video")
+    excerpt = f"{category}: {media_name} — обнаружен небезопасный контент"
     if message.caption:
         excerpt += f" | подпись: {message.caption[:250]}"
+
     await _save_violation(
-        bot=bot, chat_id=message.chat_id, user_id=message.from_user.id,
-        message_id=message.message_id, message_text=excerpt,
-        toxic_score=max(nsfw_score, 0.99 if is_violation and not nsfw_score else nsfw_score),
+        bot=bot,
+        chat_id=message.chat_id,
+        user_id=message.from_user.id,
+        message_id=message.message_id,
+        message_text=excerpt,
+        toxic_score=score,
         first_name=message.from_user.first_name or "Пользователь",
         username=message.from_user.username,
+        category=category,
+        media_type=media_type,
     )
-    logger.warning("NSFW media violation: user=%s message=%s kind=%s", message.from_user.id, message.message_id, media_name)
-
+    logger.warning(
+        "Unsafe media violation: category=%s user=%s message=%s kind=%s",
+        category, message.from_user.id, message.message_id, media_name,
+    )
 
 async def check_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
@@ -1451,7 +1489,7 @@ async def check_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         return
     if not API_TOKEN:
         return
-    if not (message.photo or message.sticker or message.video or message.video_note or message.animation):
+    if not (message.photo or message.sticker or message.video or message.video_note):
         return
     key = (message.chat_id, message.message_id)
     if key in _queued_media:
@@ -1620,6 +1658,7 @@ async def moderation_callback(
                     chat_id,
                     user_id,
                 )
+                reason = await _get_violation_reason(chat_id, user_id)
                 await _notify_group_action(
                     context.bot,
                     chat_id=chat_id,
@@ -1627,11 +1666,12 @@ async def moderation_callback(
                     action="ban",
                     deleted=deleted,
                     failed=failed,
+                    reason=reason,
                 )
 
                 result_text = (
                     "🔨 Пользователь заблокирован администратором. "
-                    f"Удалено сообщений: {deleted}; ошибок удаления: {failed}."
+                    f"Удалено медиа-сообщений: {deleted}; ошибок удаления: {failed}."
                 )
 
             elif action == "mute":
@@ -1667,6 +1707,7 @@ async def moderation_callback(
                     chat_id,
                     user_id,
                 )
+                reason = await _get_violation_reason(chat_id, user_id)
                 await _notify_group_action(
                     context.bot,
                     chat_id=chat_id,
@@ -1674,11 +1715,12 @@ async def moderation_callback(
                     action="mute",
                     deleted=deleted,
                     failed=failed,
+                    reason=reason,
                 )
 
                 result_text = (
                     "🔇 Мут на 24 часа подтверждён администратором. "
-                    f"Удалено сообщений: {deleted}; ошибок удаления: {failed}."
+                    f"Удалено медиа-сообщений: {deleted}; ошибок удаления: {failed}."
                 )
 
             await query.answer(
