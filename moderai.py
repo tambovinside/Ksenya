@@ -684,8 +684,9 @@ async def _notify_group_action(
     deleted: int,
     failed: int,
     reason: str,
+    include_cleanup: bool = True,
 ) -> None:
-    """Публично сообщает группе о подтверждённом решении администратора."""
+    """Публично сообщает группе о применённой мере модерации."""
     user_link = f'<a href="tg://user?id={user_id}">Участник</a>'
 
     if action == "ban":
@@ -693,25 +694,27 @@ async def _notify_group_action(
     else:
         heading = f"🔇 {user_link} получил мут на 24 часа. Причина: {html.escape(reason)}."
 
-    if deleted and not failed:
-        cleanup = f"Удалено медиа-сообщений с нарушениями: {deleted}."
-    elif deleted and failed:
-        cleanup = (
-            f"Удалось удалить сообщений: {deleted}; "
-            f"не удалось удалить медиа-сообщений: {failed}."
-        )
-    elif failed:
-        cleanup = (
-            "Не удалось удалить отмеченные сообщения. "
-            "Проверьте, есть ли у бота право удалять сообщения."
-        )
-    else:
-        cleanup = "Отмеченные сообщения для удаления не найдены."
+    cleanup = ""
+    if include_cleanup:
+        if deleted and not failed:
+            cleanup = f"\nУдалено медиа-сообщений с нарушениями: {deleted}."
+        elif deleted and failed:
+            cleanup = (
+                f"\nУдалось удалить сообщений: {deleted}; "
+                f"не удалось удалить медиа-сообщений: {failed}."
+            )
+        elif failed:
+            cleanup = (
+                "\nНе удалось удалить отмеченные сообщения. "
+                "Проверьте, есть ли у бота право удалять сообщения."
+            )
+        else:
+            cleanup = "\nОтмеченные сообщения для удаления не найдены."
 
     try:
         await bot.send_message(
             chat_id=chat_id,
-            text=f"{heading}\n{cleanup}",
+            text=f"{heading}{cleanup}",
             parse_mode=ParseMode.HTML,
             disable_web_page_preview=True,
         )
@@ -967,6 +970,17 @@ async def _save_violation(
                         user_id,
                         existing_alert_id,
                     )
+                    reason = await _get_violation_reason(chat_id, user_id)
+                    await _notify_group_action(
+                        bot,
+                        chat_id=chat_id,
+                        user_id=user_id,
+                        action="mute",
+                        deleted=0,
+                        failed=0,
+                        reason=reason,
+                        include_cleanup=False,
+                    )
                 else:
                     await db._exec(
                         """
@@ -1060,6 +1074,19 @@ async def _save_violation(
                 alert_id,
             ],
         )
+
+        if auto_muted:
+            reason = await _get_violation_reason(chat_id, user_id)
+            await _notify_group_action(
+                bot,
+                chat_id=chat_id,
+                user_id=user_id,
+                action="mute",
+                deleted=0,
+                failed=0,
+                reason=reason,
+                include_cleanup=False,
+            )
 
         try:
             await _notify_admin(
