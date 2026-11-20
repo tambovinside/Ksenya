@@ -53,6 +53,7 @@ logger = logging.getLogger("moderai")
 # ============================================================
 
 API_URL = "https://tambovinside.onrender.com/check"
+SPAM_API_URL = "https://tambovinside.onrender.com/check-spam"
 IMAGE_API_URL = "https://tambovinside.onrender.com/check-image"
 
 API_TOKEN = os.getenv("AImoder", "").strip()
@@ -67,6 +68,8 @@ VIOLATION_THRESHOLD = 3
 # Засчитываем нарушение только при высокой уверенности Harmony.
 # Низкая уверенность часто соответствует отдельному мату без оскорбления/травли.
 MIN_TOXIC_SCORE = 0.80
+# FastText model: spam probability threshold; configurable in bot environment.
+MIN_SPAM_SCORE = float(os.getenv("SPAM_THRESHOLD", "0.90"))
 
 WINDOW_SECONDS = 60 * 60
 MUTE_SECONDS = 24 * 60 * 60
@@ -472,6 +475,34 @@ async def _classify(text: str) -> dict[str, Any] | None:
     return None
 
 
+async def _classify_spam(text: str) -> dict[str, Any] | None:
+    """Проверяет сообщение отдельным FastText endpoint."""
+    if not API_TOKEN:
+        return None
+    session = await _get_session()
+    headers = {"X-API-Token": API_TOKEN}
+    payload = {"text": text[:MAX_TEXT_LENGTH]}
+    async with _request_semaphore:
+        try:
+            async with session.post(SPAM_API_URL, json=payload, headers=headers) as response:
+                if response.status != 200:
+                    body = (await response.text())[:300]
+                    logger.warning("FastText spam HTTP %s: %s", response.status, body)
+                    return None
+                result = await response.json(content_type=None)
+                if not isinstance(result, dict) or "spam_score" not in result:
+                    logger.warning("FastText spam returned invalid JSON: %r", result)
+                    return None
+                return result
+        except asyncio.TimeoutError:
+            logger.warning("FastText spam request timeout")
+        except (aiohttp.ClientError, ValueError):
+            logger.exception("FastText spam request failed")
+        except Exception:
+            logger.exception("Unexpected FastText spam error")
+    return None
+
+
 async def _classify_images(images: list[tuple[str, bytes]]) -> dict[str, Any] | None:
     """Отправляет один или несколько кадров на отдельный endpoint классификатора."""
     if not API_TOKEN or not images:
@@ -672,6 +703,8 @@ async def _get_violation_reason(chat_id: int, user_id: int) -> str:
         labels.append("NSFW — сексуальный контент или нагота")
     if "TOXIC" in categories:
         labels.append("оскорбления или травля")
+    if "SPAM" in categories:
+        labels.append("реклама или спам")
     return "; ".join(labels) if labels else "нарушение правил сообщества"
 
 
@@ -741,6 +774,7 @@ async def _notify_admin(
     auto_muted: bool,
     toxic_score: float,
     message_text: str,
+    category: str = "TOXIC",
 ) -> None:
     """Отправляет спокойную служебную карточку только администратору в ЛС."""
     if not ADMIN_ID:
@@ -762,6 +796,7 @@ async def _notify_admin(
         "<b>Проверка модерации</b>\n"
         f"Участник: {user_link}\n"
         f"Нарушений за 1 час: <b>{count}/{VIOLATION_THRESHOLD}</b>\n"
+        f"Категория: <b>{html.escape(category)}</b>\n"
         f"Оценка модели: <b>{toxic_score * 100:.1f}%</b>\n"
         f"{html.escape(status)}\n\n"
         f"<b>Последнее сообщение:</b>\n<blockquote>{excerpt}</blockquote>"
@@ -1100,6 +1135,7 @@ async def _save_violation(
                 auto_muted=auto_muted,
                 toxic_score=toxic_score,
                 message_text=message_text,
+                category=category,
             )
 
         except TelegramError:
@@ -1117,71 +1153,54 @@ async def _process_message(
     bot,
     context_text: str = "",
 ) -> None:
-
-    text = (
-        message.text
-        or message.caption
-        or ""
-    ).strip()
-
-    if not text:
+    text = (message.text or message.caption or "").strip()
+    if not text or not message.from_user:
         return
 
-    # API-контракт сервера остаётся прежним: передаём один параметр text,
-    # но внутри него есть короткая история и отдельно отмечено текущее сообщение.
+    # Toxicity receives conversation context; spam classifier receives the
+    # original message only. Both results are evaluated independently.
     model_input = context_text or text
-    result = await _classify(model_input)
-
-    if not result:
-        return
-
-    try:
-        classification = int(result.get("class", 0))
-
-        if classification not in (0, 1):
-            logger.warning(
-                "Unknown Harmony class: %r",
-                classification,
-            )
-            return
-
-        toxic_score = _parse_score(
-            result.get("toxic_score", 0)
-        )
-
-    except (TypeError, ValueError):
-        logger.warning(
-            "Invalid Harmony result: %r",
-            result,
-        )
-        return
-
-    logger.info(
-        "Harmony: user=%s message=%s class=%s "
-        "toxic=%.2f%% latency=%s",
-        message.from_user.id if message.from_user else None,
-        message.message_id,
-        classification,
-        toxic_score * 100,
-        result.get("latency_ms"),
+    toxic_result, spam_result = await asyncio.gather(
+        _classify(model_input),
+        _classify_spam(text),
+        return_exceptions=True,
     )
 
-    # Не считаем class=1 достаточным основанием: модель может пометить
-    # отдельное ругательство как токсичное без реального оскорбления.
-    # Нарушение засчитывается только при class=1 и уверенности >= порога.
-    if classification != 1 or toxic_score < MIN_TOXIC_SCORE:
-        logger.info(
-            "Harmony ignored as low-confidence/non-violation: "
-            "user=%s message=%s class=%s score=%.2f%% threshold=%.2f%%",
-            message.from_user.id if message.from_user else None,
-            message.message_id,
-            classification,
-            toxic_score * 100,
-            MIN_TOXIC_SCORE * 100,
-        )
-        return
+    categories: list[str] = []
+    scores: list[float] = []
 
-    if not message.from_user:
+    if isinstance(toxic_result, dict):
+        try:
+            classification = int(toxic_result.get("class", 0))
+            toxic_score = _parse_score(toxic_result.get("toxic_score", 0))
+            if classification in (0, 1) and classification == 1 and toxic_score >= MIN_TOXIC_SCORE:
+                categories.append("TOXIC")
+                scores.append(toxic_score)
+            logger.info(
+                "Harmony: user=%s message=%s class=%s toxic=%.2f%% latency=%s",
+                message.from_user.id, message.message_id, classification,
+                toxic_score * 100, toxic_result.get("latency_ms"),
+            )
+        except (TypeError, ValueError):
+            logger.warning("Invalid Harmony result: %r", toxic_result)
+    elif isinstance(toxic_result, BaseException):
+        logger.error("Toxicity classifier task failed: %s", toxic_result)
+
+    if isinstance(spam_result, dict):
+        spam_score = _parse_score(spam_result.get("spam_score", 0))
+        is_spam = bool(spam_result.get("is_spam")) or spam_score >= MIN_SPAM_SCORE
+        logger.info(
+            "FastText spam: user=%s message=%s spam=%s score=%.2f%% threshold=%.2f%% latency=%s",
+            message.from_user.id, message.message_id, is_spam,
+            spam_score * 100, MIN_SPAM_SCORE * 100, spam_result.get("latency_ms"),
+        )
+        if is_spam:
+            categories.append("SPAM")
+            scores.append(spam_score)
+    elif isinstance(spam_result, BaseException):
+        logger.error("Spam classifier task failed: %s", spam_result)
+
+    if not categories:
         return
 
     await _save_violation(
@@ -1190,9 +1209,10 @@ async def _process_message(
         user_id=message.from_user.id,
         message_id=message.message_id,
         message_text=text,
-        toxic_score=toxic_score,
+        toxic_score=max(scores, default=0.0),
         first_name=message.from_user.first_name or "Пользователь",
         username=message.from_user.username,
+        category="+".join(sorted(set(categories))),
     )
 
 
@@ -1205,7 +1225,7 @@ async def check_message(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     """
-    Каждое текстовое сообщение и подпись отправляются в очередь Harmony.
+    Каждое текстовое сообщение и подпись отправляются в общую очередь AI-модерации.
     Команды также проверяются, если они попадают в этот handler.
     """
 
