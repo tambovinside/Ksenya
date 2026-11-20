@@ -630,6 +630,15 @@ def build_app() -> Application:
             group=-5,
         )
         app.add_handler(
+            MessageHandler(
+                filters.Chat(chat_id=CHAT_ID)
+                & (filters.PHOTO | filters.VIDEO | filters.VIDEO_NOTE | filters.ANIMATION | filters.Sticker.ALL)
+                & ~filters.StatusUpdate.ALL,
+                moderai.check_media,
+            ),
+            group=-6,
+        )
+        app.add_handler(
             CallbackQueryHandler(
                 moderai.moderation_callback,
                 pattern=r"^modai:",
