@@ -1,26 +1,5 @@
 """
 Ksenya AI Security — многоступенчатая AI-модерация Telegram.
-
-Что исправлено в этой версии (по результатам аудита):
-- NSFW / NSFL теперь срабатывают мгновенно (как SPAM), а не после 4 нарушений.
-- Отдельные семафоры для токсик / спам / image — больше нет полной сериализации.
-- Увеличены воркеры (4) и очередь (1000) — сообщения больше не теряются пачками.
-- Укорочены таймауты API (25с/20с) — зависший запрос не блокирует всё.
-- Устойчивый парсинг ответов классификаторов (score / scores / predictions / label-алиасы).
-- Поддержка message.animation (GIF раньше не проверялись).
-- Корректный merge категорий для каптион+фото (TOXIC+NSFW больше не теряется).
-- Мгновенные действия не дублируются, если сообщение обработано дважды.
-- _try_mute больше не может заблокировать воркер на минуту.
-- Очередь медиа и текста разделена.
-- Уведомление админу при перегрузке очереди (throttled).
-- При бане/муте удаляются и текстовые подтверждённые нарушения.
-- Счётчик нарушений для токсика больше не включает строки с NSFW/NSFL/SPAM.
-
-Логика наказаний:
-- SPAM  -> мут 24ч + удаление сообщения (немедленно).
-- NSFL  -> мут 24ч + удаление сообщения (немедленно).
-- NSFW  -> мут 24ч + удаление сообщения (немедленно).
-- TOXIC -> накопление: >= VIOLATION_THRESHOLD уверенных нарушений за WINDOW_SECONDS.
 """
 
 import asyncio
@@ -76,25 +55,31 @@ VIOLATION_THRESHOLD = 3
 MIN_TOXIC_SCORE = 0.85
 
 # FastText: реклама/спам.
-MIN_SPAM_SCORE = float(os.getenv("SPAM_THRESHOLD", "0.92"))
+_spam_env = os.getenv("SPAM_THRESHOLD")
+MIN_SPAM_SCORE = float(_spam_env or "0.92")
 
 # Медиа: уверенность image-классификатора.
-MIN_MEDIA_SCORE = float(os.getenv("MEDIA_THRESHOLD", "0.85"))
+_media_env = os.getenv("MEDIA_THRESHOLD")
+MIN_MEDIA_SCORE = float(_media_env or "0.85")
 
 # Окно накопления для токсика.
 WINDOW_SECONDS = 30 * 60
 MUTE_SECONDS = 24 * 60 * 60
 
-# HTTP — короче, чтобы не блокировать конвейер.
-REQUEST_TIMEOUT_SECONDS = 25
-CONNECT_TIMEOUT_SECONDS = 10
-SOCK_READ_TIMEOUT_SECONDS = 20
+# HTTP — оригинальные значения, покрывают холодный старт Render.
+REQUEST_TIMEOUT_SECONDS = 70
+CONNECT_TIMEOUT_SECONDS = 20
+SOCK_READ_TIMEOUT_SECONDS = 60
 
-IMAGE_TIMEOUT_TOTAL = 90
-IMAGE_TIMEOUT_CONNECT = 30
-IMAGE_TIMEOUT_READ = 60
+IMAGE_TIMEOUT_TOTAL = 180
+IMAGE_TIMEOUT_CONNECT = 60
+IMAGE_TIMEOUT_READ = 150
 
-# Конкурентность — отдельные семафоры на каждый эндпоинт.
+WARMUP_TIMEOUT_TOTAL = 150
+WARMUP_TIMEOUT_CONNECT = 30
+WARMUP_TIMEOUT_READ = 140
+
+# Конкурентность.
 MAX_PARALLEL_REQUESTS = 4
 MAX_TOXIC_PARALLEL = 4
 MAX_SPAM_PARALLEL = 4
@@ -288,6 +273,10 @@ async def init_db() -> None:
         """
     )
 
+    # Прогреваем API до того, как пойдут реальные сообщения.
+    if API_TOKEN:
+        asyncio.create_task(_warmup_api())
+
     _start_workers()
     _start_media_worker()
 
@@ -296,6 +285,14 @@ async def init_db() -> None:
             "AImoder отсутствует в Render Environment. AI-модерация выключена."
         )
     else:
+        if _spam_env:
+            logger.info(
+                "SPAM_THRESHOLD env=%s overrides default 0.92", _spam_env
+            )
+        if _media_env:
+            logger.info(
+                "MEDIA_THRESHOLD env=%s overrides default 0.85", _media_env
+            )
         logger.info(
             "Ksenya AI Security initialized: chat=%s threshold=%s window=%s "
             "workers=%s toxic=%s spam=%s media=%s",
@@ -408,6 +405,28 @@ async def _get_session() -> aiohttp.ClientSession:
         )
         _session = aiohttp.ClientSession(timeout=timeout, connector=connector)
     return _session
+
+
+async def _warmup_api() -> None:
+    """Один долгий запрос на старте, чтобы разбудить Render до первых сообщений."""
+    if not API_TOKEN:
+        return
+    try:
+        session = await _get_session()
+        async with session.post(
+            API_URL,
+            json={"text": "warmup"},
+            headers={"X-API-Token": API_TOKEN},
+            timeout=aiohttp.ClientTimeout(
+                total=WARMUP_TIMEOUT_TOTAL,
+                connect=WARMUP_TIMEOUT_CONNECT,
+                sock_read=WARMUP_TIMEOUT_READ,
+            ),
+        ) as response:
+            await response.read()
+            logger.info("API warmup: status=%s", response.status)
+    except Exception:
+        logger.warning("API warmup failed", exc_info=True)
 
 
 async def close() -> None:
@@ -1039,7 +1058,6 @@ async def _handle_threshold_action(
         mute_active = was_auto_muted == 1 and old_until > now
 
         if mute_active:
-            # Пользователь уже наказан — просто обновляем счётчик.
             await db._exec(
                 "UPDATE ai_moderation_alerts SET violation_count=?, "
                 "message_id=? WHERE alert_id=?",
@@ -1047,7 +1065,6 @@ async def _handle_threshold_action(
             )
             return
 
-        # Пытаемся наказать снова (мьют был, но не применился / истёк).
         auto_muted = await _try_mute(bot, chat_id, user_id)
         if auto_muted:
             new_until = now + MUTE_SECONDS
@@ -1180,7 +1197,6 @@ async def _save_violation(
         is_new = int(getattr(inserted, "rows_affected", 0) or 0) > 0
 
         if not is_new:
-            # Строка уже есть — мерджим категорию и обновляем медиа-метку.
             existing = await db._exec(
                 "SELECT category, media_type FROM ai_moderation_violations "
                 "WHERE chat_id=? AND message_id=?",
@@ -1233,7 +1249,6 @@ async def _save_violation(
 
         effective_category = category
 
-        # Мгновенные категории.
         if _is_immediate_category(effective_category):
             await _handle_immediate_action(
                 bot=bot,
@@ -1249,7 +1264,6 @@ async def _save_violation(
             )
             return
 
-        # Токсичные — накопление.
         await db._exec(
             "DELETE FROM ai_moderation_violations WHERE created_at < ?", [cutoff]
         )
