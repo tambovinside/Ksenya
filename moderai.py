@@ -9,7 +9,7 @@ Ksenya AI Security — многоступенчатая AI-модерация Te
 - Один одновременный запрос Harmony, чтобы не перегружать API.
 - Увеличенный таймаут для холодного старта Render и защита от зависших запросов.
 - Сохранение нарушений в Turso.
-- 5 нарушений за 2 часа = мут на 24 часа.
+- 3 нарушения за 1 час = мут на 24 часа.
 - Спокойные служебные карточки отправляются администратору в личные сообщения.
 """
 
@@ -20,6 +20,11 @@ import logging
 import os
 import secrets
 import time
+import io
+import re
+import subprocess
+import tempfile
+from pathlib import Path
 
 from datetime import datetime, timedelta, timezone
 from typing import Any
@@ -48,6 +53,7 @@ logger = logging.getLogger("moderai")
 # ============================================================
 
 API_URL = "https://tambovinside.onrender.com/check"
+IMAGE_API_URL = "https://tambovinside.onrender.com/check-image"
 
 API_TOKEN = os.getenv("AImoder", "").strip()
 
@@ -56,13 +62,13 @@ CHAT_ID = int(os.getenv("CHAT_ID", "0") or 0)
 
 ADMIN_MENTION = "@YouWarm"
 
-VIOLATION_THRESHOLD = 5
+VIOLATION_THRESHOLD = 3
 
 # Засчитываем нарушение только при высокой уверенности Harmony.
 # Низкая уверенность часто соответствует отдельному мату без оскорбления/травли.
 MIN_TOXIC_SCORE = 0.80
 
-WINDOW_SECONDS = 2 * 60 * 60
+WINDOW_SECONDS = 60 * 60
 MUTE_SECONDS = 24 * 60 * 60
 
 # Render free-сервис может просыпаться после простоя. Даем API время
@@ -101,6 +107,10 @@ _user_locks: dict[tuple[int, int], asyncio.Lock] = {}
 
 # Защита от повторного добавления одного сообщения.
 _queued_messages: set[tuple[int, int]] = set()
+_queued_media: set[tuple[int, int]] = set()
+MAX_MEDIA_QUEUE_SIZE = 30
+_media_queue: asyncio.Queue | None = None
+_media_worker: asyncio.Task | None = None
 
 
 # ============================================================
@@ -202,6 +212,7 @@ async def init_db() -> None:
     )
 
     _start_workers()
+    _start_media_worker()
 
     if not API_TOKEN:
         logger.warning(
@@ -235,6 +246,31 @@ def _start_workers() -> None:
         task = asyncio.create_task(_worker_loop())
         _workers.add(task)
         task.add_done_callback(_workers.discard)
+
+
+def _start_media_worker() -> None:
+    global _media_queue, _media_worker
+    if _media_queue is None:
+        _media_queue = asyncio.Queue(maxsize=MAX_MEDIA_QUEUE_SIZE)
+    if _media_worker is None or _media_worker.done():
+        _media_worker = asyncio.create_task(_media_worker_loop())
+
+
+async def _media_worker_loop() -> None:
+    while True:
+        item = await _media_queue.get()
+        try:
+            message, bot = item
+            await _process_media_message(message, bot)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.exception("Ошибка проверки изображения/видео AI-модерацией")
+        finally:
+            if item:
+                message = item[0]
+                _queued_media.discard((message.chat_id, message.message_id))
+            _media_queue.task_done()
 
 
 async def _worker_loop() -> None:
@@ -298,14 +334,21 @@ async def close() -> None:
 
     if _queue is not None:
         try:
-            await asyncio.wait_for(
-                _queue.join(),
-                timeout=5,
-            )
+            await asyncio.wait_for(_queue.join(), timeout=5)
         except asyncio.TimeoutError:
-            logger.warning(
-                "Очередь AI-модерации не успела полностью обработаться"
-            )
+            logger.warning("Очередь AI-модерации не успела полностью обработаться")
+
+    if _media_queue is not None:
+        try:
+            await asyncio.wait_for(_media_queue.join(), timeout=5)
+        except asyncio.TimeoutError:
+            logger.warning("Очередь медиа-модерации не успела обработаться")
+
+    global _media_worker
+    if _media_worker is not None:
+        _media_worker.cancel()
+        await asyncio.gather(_media_worker, return_exceptions=True)
+        _media_worker = None
 
     for task in list(_workers):
         task.cancel()
@@ -415,6 +458,34 @@ async def _classify(text: str) -> dict[str, Any] | None:
     return None
 
 
+async def _classify_images(images: list[tuple[str, bytes]]) -> dict[str, Any] | None:
+    """Отправляет один или несколько кадров на отдельный endpoint классификатора."""
+    if not API_TOKEN or not images:
+        return None
+    session = await _get_session()
+    headers = {"X-API-Token": API_TOKEN}
+    form = aiohttp.FormData()
+    for filename, content in images:
+        form.add_field("files", content, filename=filename, content_type="image/jpeg")
+    async with _request_semaphore:
+        try:
+            image_timeout = aiohttp.ClientTimeout(total=180, connect=80, sock_read=150)
+            async with session.post(IMAGE_API_URL, data=form, headers=headers, timeout=image_timeout) as response:
+                if response.status != 200:
+                    body = (await response.text())[:300]
+                    logger.warning("Image classifier HTTP %s: %s", response.status, body)
+                    return None
+                result = await response.json(content_type=None)
+                return result if isinstance(result, dict) else None
+        except asyncio.TimeoutError:
+            logger.warning("Image classifier request timeout")
+        except (aiohttp.ClientError, ValueError):
+            logger.exception("Image classifier request failed")
+        except Exception:
+            logger.exception("Unexpected image classifier error")
+    return None
+
+
 # ============================================================
 # USER LOCKS
 # ============================================================
@@ -510,7 +581,7 @@ async def _notify_admin(
     text = (
         "<b>Проверка модерации</b>\n"
         f"Участник: {user_link}\n"
-        f"Нарушений за 2 часа: <b>{count}/{VIOLATION_THRESHOLD}</b>\n"
+        f"Нарушений за 1 час: <b>{count}/{VIOLATION_THRESHOLD}</b>\n"
         f"Оценка модели: <b>{toxic_score * 100:.1f}%</b>\n"
         f"{html.escape(status)}\n\n"
         f"<b>Последнее сообщение:</b>\n<blockquote>{excerpt}</blockquote>"
@@ -998,6 +1069,217 @@ async def check_message(
 
 
 # ============================================================
+# MEDIA MODERATION
+# ============================================================
+
+MAX_MEDIA_BYTES = 20 * 1024 * 1024
+
+
+def _compress_image_bytes(raw: bytes) -> bytes:
+    from PIL import Image
+    image = Image.open(io.BytesIO(raw))
+    image.load()
+    image.thumbnail((512, 512), Image.Resampling.LANCZOS)
+    if image.mode in ("RGBA", "LA") or (image.mode == "P" and "transparency" in image.info):
+        rgba = image.convert("RGBA")
+        background = Image.new("RGBA", rgba.size, (255, 255, 255, 255))
+        background.alpha_composite(rgba)
+        image = background.convert("RGB")
+    else:
+        image = image.convert("RGB")
+    output = io.BytesIO()
+    image.save(output, format="JPEG", quality=82, optimize=True)
+    return output.getvalue()
+
+
+def _render_tgs(raw: bytes) -> bytes:
+    """Рендерит один средний кадр Telegram-анимации TGS."""
+    from rlottie_python import LottieAnimation
+    with tempfile.NamedTemporaryFile(suffix=".tgs", delete=False) as tmp:
+        tmp.write(raw)
+        path = tmp.name
+    animation = None
+    try:
+        animation = LottieAnimation.from_tgs(path)
+        total = 1
+        for attr in ("lottie_animation_get_totalframe", "get_totalframe", "get_total_frames", "total_frames"):
+            value = getattr(animation, attr, None)
+            if callable(value):
+                total = int(value())
+                break
+            if value is not None:
+                total = int(value)
+                break
+        if total <= 0:
+            inner = getattr(animation, "lottie_animation", None)
+            total = int(getattr(inner, "totalFrame", 1) or 1)
+        frame = max(0, (total - 1) // 2)
+        rendered = animation.render_pillow_frame(frame_num=frame)
+        if hasattr(rendered, "save"):
+            output = io.BytesIO()
+            rendered.save(output, format="PNG")
+            return _compress_image_bytes(output.getvalue())
+        if isinstance(rendered, (bytes, bytearray)):
+            return _compress_image_bytes(bytes(rendered))
+        raise RuntimeError("rlottie не вернул изображение кадра")
+    finally:
+        if animation is not None:
+            try:
+                animation.lottie_animation_destroy()
+            except Exception:
+                pass
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
+def _video_frames(raw: bytes) -> list[tuple[str, bytes]]:
+    """Извлекает пять кадров видео: начало, 25%, 50%, 75%, конец."""
+    import imageio_ffmpeg
+    ffmpeg = imageio_ffmpeg.get_ffmpeg_exe()
+    with tempfile.TemporaryDirectory(prefix="modai_video_") as folder:
+        source = Path(folder) / "source_video"
+        source.write_bytes(raw)
+        probe = subprocess.run(
+            [ffmpeg, "-hide_banner", "-i", str(source)],
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=20, check=False,
+        )
+        details = probe.stderr.decode("utf-8", errors="ignore")
+        match = re.search(r"Duration:\s*(\d+):(\d+):(\d+(?:\.\d+)?)", details)
+        if not match:
+            raise RuntimeError("Не удалось определить длительность видео")
+        duration = int(match.group(1)) * 3600 + int(match.group(2)) * 60 + float(match.group(3))
+        if duration <= 0:
+            raise RuntimeError("Видео имеет некорректную длительность")
+        times = [min(0.1, duration / 10), duration * 0.25, duration * 0.5, duration * 0.75, max(0, duration - 0.1)]
+        frames = []
+        for index, timestamp in enumerate(times, start=1):
+            output = Path(folder) / f"frame_{index}.jpg"
+            subprocess.run(
+                [ffmpeg, "-hide_banner", "-loglevel", "error", "-y", "-ss", f"{timestamp:.3f}",
+                 "-i", str(source), "-frames:v", "1", "-vf",
+                 "scale=512:512:force_original_aspect_ratio=decrease", "-q:v", "4", str(output)],
+                stdout=subprocess.PIPE, stderr=subprocess.PIPE, timeout=15, check=True,
+            )
+            frames.append((f"frame_{index}.jpg", _compress_image_bytes(output.read_bytes())))
+        return frames
+
+
+async def _download_telegram_file(bot, file_id: str) -> bytes:
+    telegram_file = await bot.get_file(file_id)
+    data = bytes(await telegram_file.download_as_bytearray())
+    if not data or len(data) > MAX_MEDIA_BYTES:
+        raise RuntimeError("Файл пустой или превышает лимит 20 МБ")
+    return data
+
+
+async def _prepare_media_images(message, bot) -> tuple[list[tuple[str, bytes]], str]:
+    if message.photo:
+        raw = await _download_telegram_file(bot, message.photo[-1].file_id)
+        return [("photo.jpg", await asyncio.to_thread(_compress_image_bytes, raw))], "фотография"
+
+    sticker = message.sticker
+    if sticker:
+        raw = await _download_telegram_file(bot, sticker.file_id)
+        if sticker.is_animated:
+            frame = await asyncio.to_thread(_render_tgs, raw)
+            return [("animated_sticker.jpg", frame)], "анимированный стикер"
+        if sticker.is_video:
+            frames = await asyncio.to_thread(_video_frames, raw)
+            return frames, "видеостикер (5 кадров)"
+        return [("sticker.jpg", await asyncio.to_thread(_compress_image_bytes, raw))], "стикер"
+
+    if message.video:
+        raw = await _download_telegram_file(bot, message.video.file_id)
+        frames = await asyncio.to_thread(_video_frames, raw)
+        return frames, "видео (5 кадров)"
+
+    if message.video_note:
+        raw = await _download_telegram_file(bot, message.video_note.file_id)
+        frames = await asyncio.to_thread(_video_frames, raw)
+        return frames, "видеосообщение (5 кадров)"
+
+    if message.animation:
+        raw = await _download_telegram_file(bot, message.animation.file_id)
+        frames = await asyncio.to_thread(_video_frames, raw)
+        return frames, "анимация (5 кадров)"
+
+    return [], "медиа"
+
+
+async def _process_media_message(message, bot) -> None:
+    if not message.from_user or message.from_user.is_bot:
+        return
+    images, media_name = await _prepare_media_images(message, bot)
+    if not images:
+        return
+    result = await _classify_images(images)
+    if not result:
+        return
+    items = result.get("results") or result.get("images") or []
+    is_violation = bool(result.get("violation"))
+    nsfw_score = 0.0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        label = str(item.get("label", "")).upper()
+        scores = item.get("scores") or {}
+        try:
+            score = float(scores.get("NSFW", scores.get("nsfw", item.get("nsfw_score", 0))) or 0)
+            if score > 1:
+                score /= 100
+        except (TypeError, ValueError):
+            score = 0.0
+        nsfw_score = max(nsfw_score, score)
+        if label == "NSFW" or item.get("violation") is True:
+            is_violation = True
+    if not is_violation:
+        logger.info("Image moderation safe: user=%s message=%s frames=%s", message.from_user.id, message.message_id, len(images))
+        return
+    excerpt = f"{media_name}: обнаружен NSFW-контент"
+    if message.caption:
+        excerpt += f" | подпись: {message.caption[:250]}"
+    await _save_violation(
+        bot=bot, chat_id=message.chat_id, user_id=message.from_user.id,
+        message_id=message.message_id, message_text=excerpt,
+        toxic_score=max(nsfw_score, 0.99 if is_violation and not nsfw_score else nsfw_score),
+        first_name=message.from_user.first_name or "Пользователь",
+        username=message.from_user.username,
+    )
+    logger.warning("NSFW media violation: user=%s message=%s kind=%s", message.from_user.id, message.message_id, media_name)
+
+
+async def check_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    message = update.effective_message
+    chat = update.effective_chat
+    user = update.effective_user
+    if not message or not chat or not user or user.is_bot:
+        return
+    if chat.type not in (ChatType.GROUP, ChatType.SUPERGROUP):
+        return
+    if CHAT_ID and chat.id != CHAT_ID:
+        return
+    if not API_TOKEN:
+        return
+    if not (message.photo or message.sticker or message.video or message.video_note or message.animation):
+        return
+    key = (message.chat_id, message.message_id)
+    if key in _queued_media:
+        return
+    if _media_queue is None or _media_worker is None or _media_worker.done():
+        _start_media_worker()
+    _queued_media.add(key)
+    try:
+        _media_queue.put_nowait((message, context.bot))
+        logger.debug("Media queued: user=%s message=%s queue=%s", user.id, message.message_id, _media_queue.qsize())
+    except asyncio.QueueFull:
+        _queued_media.discard(key)
+        logger.warning("Media moderation queue full; skipped message=%s", message.message_id)
+
+
+
+# ============================================================
 # ADMIN CALLBACKS
 # ============================================================
 
@@ -1125,7 +1407,7 @@ async def moderation_callback(
 
                 result_text = (
                     "❌ Администратор отменил срабатывание. "
-                    "Нарушения за последние 2 часа очищены."
+                    "Нарушения за последний час очищены."
                 )
 
             elif action == "ban":
