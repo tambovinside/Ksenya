@@ -546,6 +546,117 @@ async def _try_mute(
 
 
 # ============================================================
+# CONFIRMED CONTENT REMOVAL + GROUP NOTICE
+# ============================================================
+
+async def _delete_confirmed_violations(
+    bot,
+    chat_id: int,
+    user_id: int,
+) -> tuple[int, int]:
+    """Удаляет только сообщения, которые ИИ записал как нарушения.
+
+    Вызывается исключительно после успешного подтверждения админом мута
+    или бана. Сообщения за пределами текущего окна не затрагиваются.
+    """
+    cutoff = int(time.time()) - WINDOW_SECONDS
+    rs = await db._exec(
+        """
+        SELECT message_id
+        FROM ai_moderation_violations
+        WHERE chat_id = ?
+          AND user_id = ?
+          AND created_at >= ?
+        ORDER BY created_at DESC
+        """,
+        [chat_id, user_id, cutoff],
+    )
+
+    if getattr(rs, "error", False):
+        logger.error(
+            "Could not load confirmed violation messages for deletion: user=%s",
+            user_id,
+        )
+        return 0, 0
+
+    message_ids = list(dict.fromkeys(
+        int(row[0]) for row in (rs.rows or []) if row and row[0] is not None
+    ))
+    deleted = 0
+    failed = 0
+
+    for message_id in message_ids:
+        try:
+            await bot.delete_message(
+                chat_id=chat_id,
+                message_id=message_id,
+            )
+            deleted += 1
+        except TelegramError:
+            failed += 1
+            logger.warning(
+                "Could not delete confirmed violating message chat=%s message=%s",
+                chat_id,
+                message_id,
+                exc_info=True,
+            )
+
+    logger.info(
+        "Confirmed violating messages cleanup: user=%s deleted=%s failed=%s",
+        user_id,
+        deleted,
+        failed,
+    )
+    return deleted, failed
+
+
+async def _notify_group_action(
+    bot,
+    *,
+    chat_id: int,
+    user_id: int,
+    action: str,
+    deleted: int,
+    failed: int,
+) -> None:
+    """Публично сообщает группе о решении администратора без цитирования контента."""
+    user_link = f'<a href="tg://user?id={user_id}">Участник</a>'
+
+    if action == "ban":
+        heading = f"🚫 {user_link} заблокирован за запрещённый контент."
+    else:
+        heading = f"🔇 {user_link} получил мут на 24 часа за запрещённый контент."
+
+    if deleted and not failed:
+        cleanup = f"Удалено сообщений с нарушениями: {deleted}."
+    elif deleted and failed:
+        cleanup = (
+            f"Удалось удалить сообщений: {deleted}; "
+            f"не удалось удалить: {failed}."
+        )
+    elif failed:
+        cleanup = (
+            "Не удалось удалить отмеченные сообщения. "
+            "Проверьте, есть ли у бота право удалять сообщения."
+        )
+    else:
+        cleanup = "Отмеченные сообщения для удаления не найдены."
+
+    try:
+        await bot.send_message(
+            chat_id=chat_id,
+            text=f"{heading}\n{cleanup}",
+            parse_mode=ParseMode.HTML,
+            disable_web_page_preview=True,
+        )
+    except TelegramError:
+        logger.exception(
+            "Could not send moderation action notice to group chat=%s",
+            chat_id,
+        )
+
+
+# ============================================================
 # ADMIN NOTIFICATION
 # ============================================================
 
@@ -1426,8 +1537,23 @@ async def moderation_callback(
                     [alert_id],
                 )
 
+                deleted, failed = await _delete_confirmed_violations(
+                    context.bot,
+                    chat_id,
+                    user_id,
+                )
+                await _notify_group_action(
+                    context.bot,
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    action="ban",
+                    deleted=deleted,
+                    failed=failed,
+                )
+
                 result_text = (
-                    "🔨 Пользователь заблокирован администратором."
+                    "🔨 Пользователь заблокирован администратором. "
+                    f"Удалено сообщений: {deleted}; ошибок удаления: {failed}."
                 )
 
             elif action == "mute":
@@ -1458,8 +1584,23 @@ async def moderation_callback(
                     ],
                 )
 
+                deleted, failed = await _delete_confirmed_violations(
+                    context.bot,
+                    chat_id,
+                    user_id,
+                )
+                await _notify_group_action(
+                    context.bot,
+                    chat_id=chat_id,
+                    user_id=user_id,
+                    action="mute",
+                    deleted=deleted,
+                    failed=failed,
+                )
+
                 result_text = (
-                    "🔇 Мут на 24 часа подтверждён администратором."
+                    "🔇 Мут на 24 часа подтверждён администратором. "
+                    f"Удалено сообщений: {deleted}; ошибок удаления: {failed}."
                 )
 
             await query.answer(
