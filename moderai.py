@@ -515,34 +515,112 @@ async def _try_mute(
     chat_id: int,
     user_id: int,
 ) -> bool:
+    """Надёжно ограничивает участника на 24 часа.
 
-    until = (
-        datetime.now(timezone.utc)
-        + timedelta(seconds=MUTE_SECONDS)
-    )
+    Сначала проверяет права бота и статус участника, затем повторяет
+    временные сетевые ошибки и ответы Telegram с retry_after.
+    Постоянные ошибки (например, отсутствие прав или попытка ограничить
+    администратора) не маскируются повторными запросами.
+    """
+    until = datetime.now(timezone.utc) + timedelta(seconds=MUTE_SECONDS)
 
+    # Предварительная проверка прав бота. Если Telegram временно не даёт
+    # получить сведения, всё равно пробуем сам restrict_chat_member ниже:
+    # именно его ответ является окончательным.
     try:
-        await bot.restrict_chat_member(
-            chat_id=chat_id,
-            user_id=user_id,
-            permissions=_permissions_muted(),
-            until_date=until,
-        )
-
-        logger.info(
-            "Automatic mute applied: user=%s",
-            user_id,
-        )
-
-        return True
-
+        bot_member = await bot.get_chat_member(chat_id=chat_id, user_id=bot.id)
+        bot_status = str(getattr(bot_member, "status", ""))
+        can_restrict = getattr(bot_member, "can_restrict_members", None)
+        if bot_status not in ("administrator", "creator"):
+            logger.error(
+                "Mute impossible: bot is not an administrator | chat=%s bot_status=%s user=%s",
+                chat_id, bot_status, user_id,
+            )
+            return False
+        if can_restrict is False:
+            logger.error(
+                "Mute impossible: bot lacks restrict_members permission | chat=%s user=%s",
+                chat_id, user_id,
+            )
+            return False
     except TelegramError:
-        logger.exception(
-            "Unable to mute user_id=%s",
-            user_id,
+        logger.warning(
+            "Could not pre-check bot permissions; trying restrict_chat_member | chat=%s user=%s",
+            chat_id, user_id, exc_info=True,
         )
 
-        return False
+    # Telegram не разрешает ботам ограничивать создателя и администраторов.
+    try:
+        target = await bot.get_chat_member(chat_id=chat_id, user_id=user_id)
+        target_status = str(getattr(target, "status", ""))
+        if target_status in ("administrator", "creator"):
+            logger.warning(
+                "Mute skipped: target is a chat administrator | chat=%s user=%s status=%s",
+                chat_id, user_id, target_status,
+            )
+            return False
+        if target_status in ("left", "kicked"):
+            logger.warning(
+                "Mute skipped: target is not an active member | chat=%s user=%s status=%s",
+                chat_id, user_id, target_status,
+            )
+            return False
+    except TelegramError:
+        logger.warning(
+            "Could not pre-check target status; trying restrict_chat_member | chat=%s user=%s",
+            chat_id, user_id, exc_info=True,
+        )
+
+    for attempt in range(1, 4):
+        try:
+            result = await bot.restrict_chat_member(
+                chat_id=chat_id,
+                user_id=user_id,
+                permissions=_permissions_muted(),
+                until_date=until,
+            )
+            if result is False:
+                logger.error(
+                    "Telegram returned false for mute | chat=%s user=%s attempt=%s",
+                    chat_id, user_id, attempt,
+                )
+                return False
+
+            logger.info(
+                "Automatic mute applied successfully | chat=%s user=%s duration=%ss attempt=%s",
+                chat_id, user_id, MUTE_SECONDS, attempt,
+            )
+            return True
+
+        except TelegramError as error:
+            error_name = type(error).__name__
+            retry_after = getattr(error, "retry_after", None)
+            is_temporary = (
+                error_name in ("TimedOut", "NetworkError", "RetryAfter", "TelegramRetryAfter")
+                or retry_after is not None
+            )
+            logger.error(
+                "Mute request failed | chat=%s user=%s attempt=%s/3 error_type=%s error=%s",
+                chat_id, user_id, attempt, error_name, error,
+                exc_info=True,
+            )
+
+            if not is_temporary or attempt >= 3:
+                return False
+
+            delay = float(retry_after) if retry_after is not None else min(2 ** (attempt - 1), 5)
+            await asyncio.sleep(max(0.5, min(delay, 30)))
+
+        except Exception:
+            logger.exception(
+                "Unexpected error while applying mute | chat=%s user=%s attempt=%s/3",
+                chat_id, user_id, attempt,
+            )
+            if attempt >= 3:
+                return False
+            await asyncio.sleep(min(2 ** (attempt - 1), 5))
+
+    return False
 
 
 # ============================================================
