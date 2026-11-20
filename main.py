@@ -616,8 +616,8 @@ def build_app() -> Application:
 
     app.add_error_handler(_error_handler)
 
-    # AI-модерация: отдельная ранняя группа. Она быстро проверяет локальный
-    # фильтр и запускает запрос к Harmony в фоне, не блокируя остальные handlers.
+    # AI-модерация: отдельная ранняя группа. Текущий handler ставит сообщение
+    # в общую очередь для проверки токсичности и FastText-спама.
     if CHAT_ID:
         app.add_handler(
             MessageHandler(
