@@ -1,5 +1,35 @@
 """
 Ksenya AI Security — многоступенчатая AI-модерация Telegram.
+
+Полная версия с исправлениями по всем аудитам:
+
+БЛОК 1 — таймауты и холодный старт:
+- Возвращены таймауты 70с/60с (покрывают Render cold start).
+- Добавлен прогрев API на старте (_warmup_api).
+
+БЛОК 2 — производительность:
+- Отдельные семафоры для toxic/spam/image.
+- 4 воркера, очередь 1000.
+- Медиа и текст — раздельные очереди.
+- Таймауты image = 180с.
+
+БЛОК 3 — детект:
+- Устойчивый парсинг ответов классификаторов.
+- Поддержка message.animation (GIF).
+- Merge категорий для каптион+фото.
+- Счётчик токсика не включает NSFW/NSFL/SPAM.
+
+БЛОК 4 — эвристики (новое, по последнему логу):
+- FastText не ловит https://fakelink, "реклама казино", мягкие инвайты.
+- RU-Toxic-BERT даёт 32% на прямой мат — модель слабая.
+- Добавлены regex-эвристики для спама и токсика, работают ПАРАЛЛЕЛЬНО с моделями.
+- Эвристика спама → мгновенный мут + удаление.
+- Эвристика токсика → boost score до 0.99 (идёт в накопление).
+
+Логика наказаний:
+- SPAM (эвристика или модель) -> мут 24ч + удаление (немедленно).
+- NSFL/NSFW -> мут 24ч + удаление (немедленно).
+- TOXIC -> накопление: >= VIOLATION_THRESHOLD нарушений за WINDOW_SECONDS.
 """
 
 import asyncio
@@ -48,10 +78,11 @@ CHAT_ID = int(os.getenv("CHAT_ID", "0") or 0)
 
 ADMIN_MENTION = "@YouWarm"
 
-# Порог для накопления токсичных нарушений (SPAM/NSFL/NSFW — мгновенно).
-VIOLATION_THRESHOLD = 3
+# Порог накопления токсичных нарушений (SPAM/NSFL/NSFW — мгновенно).
+# Поставь 1, если хочешь мут за первое же токсичное сообщение.
+VIOLATION_THRESHOLD = int(os.getenv("VIOLATION_THRESHOLD", "3") or 3)
 
-# RU-Toxic-BERT: срабатываем только на уверенных нарушениях.
+# RU-Toxic-BERT: срабатываем на уверенных нарушениях модели.
 MIN_TOXIC_SCORE = 0.85
 
 # FastText: реклама/спам.
@@ -62,11 +93,11 @@ MIN_SPAM_SCORE = float(_spam_env or "0.92")
 _media_env = os.getenv("MEDIA_THRESHOLD")
 MIN_MEDIA_SCORE = float(_media_env or "0.85")
 
-# Окно накопления для токсика.
+# Окно накопления токсика.
 WINDOW_SECONDS = 30 * 60
 MUTE_SECONDS = 24 * 60 * 60
 
-# HTTP — оригинальные значения, покрывают холодный старт Render.
+# HTTP — покрывают холодный старт Render.
 REQUEST_TIMEOUT_SECONDS = 70
 CONNECT_TIMEOUT_SECONDS = 20
 SOCK_READ_TIMEOUT_SECONDS = 60
@@ -93,6 +124,50 @@ CONTEXT_MESSAGES = 6
 MAX_MEDIA_BYTES = 20 * 1024 * 1024
 
 IMMEDIATE_CATEGORIES = {"SPAM", "NSFL", "NSFW"}
+
+# ============================================================
+# HEURISTIC PATTERNS
+# ============================================================
+
+# Спам/реклама: ссылки, инвайты, явные призывы, казино, крипта.
+_SPAM_PATTERNS = [
+    r"https?://\S+",
+    r"t\.me/(\+|joinchat)",
+    r"t\.me/[A-Za-z0-9_]{4,}",
+    r"@[A-Za-z0-9_]{5,}",
+    r"подпис\w*\s+(на|в)\s+(канал|чат|группу|телеграм|тг|tg)",
+    r"(реклам|реклама|рекламу|spam|спам)",
+    r"(казин|ставк|букмекер|бинарн|форекс)",
+    r"(крипт|биткоин|bitcoin|usdt|toncoin)",
+    r"(заработ|заработок|доход)\s+(от|до)\s+\d",
+    r"перейди\s+по\s+ссылке",
+    r"инвестиц|пассивн\w+\s+доход",
+    r"бесплатн\w+\s+(деньги|биткоин|крипт)",
+]
+
+# Токсик: мат, прямые оскорбления, пожелания смерти.
+_TOXIC_PATTERNS = [
+    r"\b(хуй|хуя|хуё|хуе|хуи|пизд|бляд|блят|ебал|ебан|еба|ебуч|залуп)\w*",
+    r"\b(мудак|мудил|пидор|пидар|гандон|долбоёб|долбоеб|уёбок|уебок)\w*",
+    r"\b(соси|сосите|сосать|отсоси)\b",
+    r"\b(изгой|изгои|чмо|лох|лохи|дебил|дебилы|идиот|идиоты|кретин|кретины)\b",
+    r"\b(сдохни|сдохните|умри|умрите|повесься|удавись)\b",
+    r"\b(гавно|говно|дерьмо|помои|помойка)\b",
+    r"\b(нахуй|нахуя|нихуя|похуй)\b",
+    r"(русская\s+свинка|свинья\s+русская)",
+]
+
+_SPAM_REGEX = [re.compile(p, re.IGNORECASE) for p in _SPAM_PATTERNS]
+_TOXIC_REGEX = [re.compile(p, re.IGNORECASE) for p in _TOXIC_PATTERNS]
+
+
+def _heuristic_spam(text: str) -> bool:
+    return any(rx.search(text) for rx in _SPAM_REGEX)
+
+
+def _heuristic_toxic(text: str) -> bool:
+    return any(rx.search(text) for rx in _TOXIC_REGEX)
+
 
 # ============================================================
 # RUNTIME STATE
@@ -273,7 +348,6 @@ async def init_db() -> None:
         """
     )
 
-    # Прогреваем API до того, как пойдут реальные сообщения.
     if API_TOKEN:
         asyncio.create_task(_warmup_api())
 
@@ -286,16 +360,12 @@ async def init_db() -> None:
         )
     else:
         if _spam_env:
-            logger.info(
-                "SPAM_THRESHOLD env=%s overrides default 0.92", _spam_env
-            )
+            logger.info("SPAM_THRESHOLD env=%s overrides default 0.92", _spam_env)
         if _media_env:
-            logger.info(
-                "MEDIA_THRESHOLD env=%s overrides default 0.85", _media_env
-            )
+            logger.info("MEDIA_THRESHOLD env=%s overrides default 0.85", _media_env)
         logger.info(
             "Ksenya AI Security initialized: chat=%s threshold=%s window=%s "
-            "workers=%s toxic=%s spam=%s media=%s",
+            "workers=%s toxic=%s spam=%s media=%s heuristics=on",
             CHAT_ID,
             VIOLATION_THRESHOLD,
             WINDOW_SECONDS,
@@ -796,9 +866,7 @@ async def _notify_group_action(
         if deleted and not failed:
             cleanup = f"\nУдалено сообщений с нарушениями: {deleted}."
         elif deleted and failed:
-            cleanup = (
-                f"\nУдалено: {deleted}; не удалось удалить: {failed}."
-            )
+            cleanup = f"\nУдалено: {deleted}; не удалось удалить: {failed}."
         elif failed:
             cleanup = (
                 "\nНе удалось удалить отмеченные сообщения. "
@@ -848,7 +916,7 @@ async def _notify_admin(
     if "SPAM" in parts:
         details = (
             "Категория: <b>Реклама / спам</b>\n"
-            f"Оценка FastText: <b>{toxic_score * 100:.1f}%</b>\n"
+            f"Оценка: <b>{toxic_score * 100:.1f}%</b>\n"
         )
     elif parts & {"NSFL", "NSFW"}:
         details = (
@@ -859,7 +927,7 @@ async def _notify_admin(
         details = (
             f"Нарушений за окно: <b>{count}/{VIOLATION_THRESHOLD}</b>\n"
             f"Категория: <b>{html.escape(category)}</b>\n"
-            f"Оценка RU-Toxic-BERT: <b>{toxic_score * 100:.1f}%</b>\n"
+            f"Оценка: <b>{toxic_score * 100:.1f}%</b>\n"
         )
 
     text = (
@@ -887,9 +955,7 @@ async def _notify_admin(
             disable_web_page_preview=True,
         )
     except TelegramError:
-        logger.exception(
-            "Не удалось отправить уведомление админу=%s", ADMIN_ID
-        )
+        logger.exception("Не удалось отправить уведомление админу=%s", ADMIN_ID)
 
 
 # ============================================================
@@ -996,9 +1062,7 @@ async def _handle_immediate_action(
                 "Администратор уведомлён."
             )
     if not deleted:
-        text += (
-            "\nНе удалось удалить нарушающее сообщение — проверьте права бота."
-        )
+        text += "\nНе удалось удалить нарушающее сообщение — проверьте права бота."
     try:
         await bot.send_message(
             chat_id=chat_id,
@@ -1314,8 +1378,30 @@ async def _process_message(message, bot, context_text: str = "") -> None:
     if not text or not message.from_user:
         return
 
-    model_input = context_text or text
+    # 1. Эвристики — быстрее и не зависят от API.
+    heuristic_spam = _heuristic_spam(text)
+    heuristic_toxic = _heuristic_toxic(text)
 
+    if heuristic_spam:
+        logger.warning(
+            "HEURISTIC SPAM: user=%s message=%s text=%r",
+            message.from_user.id, message.message_id, text[:200],
+        )
+        await _save_violation(
+            bot=bot,
+            chat_id=message.chat_id,
+            user_id=message.from_user.id,
+            message_id=message.message_id,
+            message_text=text,
+            toxic_score=0.99,
+            first_name=message.from_user.first_name or "Пользователь",
+            username=message.from_user.username,
+            category="SPAM",
+        )
+        return
+
+    # 2. Модели — параллельно.
+    model_input = context_text or text
     toxic_result, spam_result = await asyncio.gather(
         _classify(model_input),
         _classify_spam(text),
@@ -1329,6 +1415,15 @@ async def _process_message(message, bot, context_text: str = "") -> None:
         try:
             classification = int(toxic_result.get("class", 0))
             toxic_score = _extract_toxic_score(toxic_result)
+
+            # Если эвристика нашла токсик — считаем нарушением даже при низком score модели.
+            if heuristic_toxic and toxic_score < MIN_TOXIC_SCORE:
+                logger.warning(
+                    "HEURISTIC TOXIC BOOST: user=%s message=%s model=%.2f%% -> 0.99",
+                    message.from_user.id, message.message_id, toxic_score * 100,
+                )
+                toxic_score = 0.99
+
             if toxic_score >= MIN_TOXIC_SCORE:
                 categories.append("TOXIC")
                 scores.append(toxic_score)
@@ -1346,6 +1441,8 @@ async def _process_message(message, bot, context_text: str = "") -> None:
 
     if isinstance(spam_result, dict):
         spam_score = _extract_spam_score(spam_result)
+        if heuristic_spam and spam_score < MIN_SPAM_SCORE:
+            spam_score = 0.99
         is_spam = spam_score >= MIN_SPAM_SCORE
         logger.info(
             "FastText spam: user=%s message=%s spam=%s score=%.2f%% "
