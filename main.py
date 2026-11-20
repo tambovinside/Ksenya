@@ -622,7 +622,7 @@ def build_app() -> Application:
         app.add_handler(
             MessageHandler(
                 filters.Chat(chat_id=CHAT_ID)
-                & filters.TEXT
+                & (filters.TEXT | filters.CAPTION)
                 & ~filters.COMMAND
                 & ~filters.StatusUpdate.ALL,
                 moderai.check_message,
