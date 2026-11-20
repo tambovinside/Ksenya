@@ -1,16 +1,16 @@
-
 """
 Ksenya AI Security — многоступенчатая AI-модерация Telegram.
 
 Возможности:
-- Текст и подписи проверяются Harmony с коротким контекстом переписки.
-- Мат и взрослые шутки сами по себе не должны считаться нарушением.
+- Текст и подписи проверяются RU-Toxic-BERT с коротким контекстом переписки.
+- Мат, сленг, пошлые шутки и обсуждение 18+ сами по себе НЕ считаются нарушением.
+- Мут только при реальной эскалации: несколько уверенных токсичных сообщений
+  за короткое окно, направленная агрессия, травля, угрозы.
+- Реклама/спам = немедленный мут на 24 часа и удаление сообщения (порог 0.98).
 - Ограниченная очередь сообщений.
-- Один одновременный запрос Harmony, чтобы не перегружать API.
+- Один одновременный запрос к классификатору, чтобы не перегружать API.
 - Увеличенный таймаут для холодного старта Render и защита от зависших запросов.
 - Сохранение нарушений в Turso.
-- Реклама/спам = немедленный мут на 24 часа и удаление сообщения.
-- 3 токсичных нарушения за 1 час = мут на 24 часа.
 - Спокойные служебные карточки отправляются администратору в личные сообщения.
 """
 
@@ -64,15 +64,23 @@ CHAT_ID = int(os.getenv("CHAT_ID", "0") or 0)
 
 ADMIN_MENTION = "@YouWarm"
 
-VIOLATION_THRESHOLD = 3
+# Сколько уверенных токсичных сообщений за окно нужно для мута.
+# Поднято с 3 до 4: одиночный мат/подкол не дотянет, реальная ссора — да.
+VIOLATION_THRESHOLD = 4
 
-# Засчитываем нарушение только при высокой уверенности Harmony.
-# Низкая уверенность часто соответствует отдельному мату без оскорбления/травли.
-MIN_TOXIC_SCORE = 0.80
-# FastText: реклама/спам сразу вызывает мут, без накопления нарушений.
-MIN_SPAM_SCORE = float(os.getenv("SPAM_THRESHOLD", "0.90"))
+# RU-Toxic-BERT: срабатываем только при высокой уверенности.
+# На обычном мате/подколах модель даёт 0.6–0.85 — это НЕ нарушение.
+MIN_TOXIC_SCORE = 0.92
 
-WINDOW_SECONDS = 60 * 60
+# FastText: реклама/спам только при очень высокой уверенности.
+MIN_SPAM_SCORE = float(os.getenv("SPAM_THRESHOLD", "0.98"))
+
+# Медиа: минимальная уверенность image-классификатора для NSFL/NSFW.
+MIN_MEDIA_SCORE = 0.85
+
+# Окно накопления нарушений сокращено до 30 минут: медленная эскалация
+# в течение часа не должна суммироваться в мут.
+WINDOW_SECONDS = 30 * 60
 MUTE_SECONDS = 24 * 60 * 60
 
 # Render free-сервис может просыпаться после простоя. Даем API время
@@ -81,19 +89,19 @@ REQUEST_TIMEOUT_SECONDS = 70
 CONNECT_TIMEOUT_SECONDS = 12
 SOCK_READ_TIMEOUT_SECONDS = 60
 
-# Один запрос одновременно: не перегружаем небольшой сервер Harmony.
+# Один запрос одновременно: не перегружаем небольшой сервер.
 MAX_PARALLEL_REQUESTS = 1
 
 # Ограниченная очередь. При перегрузке бот не блокирует обработку чата.
 MAX_QUEUE_SIZE = 250
 
-# Максимальная длина текста для Harmony.
+# Максимальная длина текста для классификатора.
 MAX_TEXT_LENGTH = 1000
 
 # Сохраняем небольшой контекст последних сообщений группы в памяти процесса.
 # Он передаётся модели вместе с текущим сообщением, чтобы отличать ответную
 # шутку/подкол от направленной травли или эскалации конфликта.
-CONTEXT_MESSAGES = 4
+CONTEXT_MESSAGES = 6
 _recent_messages: dict[int, deque] = defaultdict(
     lambda: deque(maxlen=CONTEXT_MESSAGES)
 )
@@ -115,13 +123,6 @@ _queued_media: set[tuple[int, int]] = set()
 MAX_MEDIA_QUEUE_SIZE = 30
 _media_queue: asyncio.Queue | None = None
 _media_worker: asyncio.Task | None = None
-
-
-# ============================================================
-# MESSAGE PREPARATION
-# ============================================================
-
-# Проверяем текст и подписи с небольшим контекстом предыдущих сообщений.
 
 
 # ============================================================
@@ -253,11 +254,13 @@ async def init_db() -> None:
     else:
         logger.info(
             "Ksenya AI Security initialized: "
-            "chat=%s threshold=%s window=%s workers=%s",
+            "chat=%s threshold=%s window=%s workers=%s toxic=%s spam=%s",
             CHAT_ID,
             VIOLATION_THRESHOLD,
             WINDOW_SECONDS,
             MAX_PARALLEL_REQUESTS,
+            MIN_TOXIC_SCORE,
+            MIN_SPAM_SCORE,
         )
 
 
@@ -401,7 +404,7 @@ async def close() -> None:
 
 
 # ============================================================
-# HARMONY API
+# CLASSIFIER API
 # ============================================================
 
 def _parse_score(value: Any) -> float:
@@ -422,6 +425,7 @@ def _parse_score(value: Any) -> float:
 
 
 async def _classify(text: str) -> dict[str, Any] | None:
+    """RU-Toxic-BERT: проверяет текст с контекстом переписки."""
     if not API_TOKEN:
         return None
 
@@ -447,7 +451,7 @@ async def _classify(text: str) -> dict[str, Any] | None:
                     body = (await response.text())[:300]
 
                     logger.warning(
-                        "Harmony HTTP %s: %s",
+                        "RU-Toxic-BERT HTTP %s: %s",
                         response.status,
                         body,
                     )
@@ -460,14 +464,14 @@ async def _classify(text: str) -> dict[str, Any] | None:
 
                 if not isinstance(result, dict):
                     logger.warning(
-                        "Harmony returned invalid JSON: %r",
+                        "RU-Toxic-BERT returned invalid JSON: %r",
                         result,
                     )
                     return None
 
                 if "class" not in result:
                     logger.warning(
-                        "Harmony response has no class: %r",
+                        "RU-Toxic-BERT response has no class: %r",
                         result,
                     )
                     return None
@@ -475,16 +479,16 @@ async def _classify(text: str) -> dict[str, Any] | None:
                 return result
 
         except asyncio.TimeoutError:
-            logger.warning("Harmony request timeout")
+            logger.warning("RU-Toxic-BERT request timeout")
 
         except aiohttp.ClientError:
-            logger.exception("Harmony connection error")
+            logger.exception("RU-Toxic-BERT connection error")
 
         except ValueError:
-            logger.exception("Harmony JSON parsing error")
+            logger.exception("RU-Toxic-BERT JSON parsing error")
 
         except Exception:
-            logger.exception("Unexpected Harmony error")
+            logger.exception("Unexpected RU-Toxic-BERT error")
 
     return None
 
@@ -583,11 +587,7 @@ async def _try_mute(
     chat_id: int,
     user_id: int,
 ) -> bool:
-    """Применяет мут одним основным запросом без предварительных сетевых проверок.
-
-    Это не задерживает модерацию двумя дополнительными get_chat_member.
-    Временные сетевые ошибки и RetryAfter повторяются до трёх раз.
-    """
+    """Применяет мут одним основным запросом без предварительных сетевых проверок."""
     until = datetime.now(timezone.utc) + timedelta(seconds=MUTE_SECONDS)
 
     for attempt in range(1, 4):
@@ -639,6 +639,7 @@ async def _try_mute(
 
     return False
 
+
 # ============================================================
 # CONFIRMED CONTENT REMOVAL + GROUP NOTICE
 # ============================================================
@@ -648,11 +649,7 @@ async def _delete_confirmed_violations(
     chat_id: int,
     user_id: int,
 ) -> tuple[int, int]:
-    """Удаляет только сообщения, которые ИИ записал как нарушения.
-
-    Вызывается исключительно после успешного подтверждения админом мута
-    или бана. Сообщения за пределами текущего окна не затрагиваются.
-    """
+    """Удаляет только сообщения, которые ИИ записал как нарушения."""
     cutoff = int(time.time()) - WINDOW_SECONDS
     rs = await db._exec(
         """
@@ -820,9 +817,9 @@ async def _notify_admin(
         details = f"Категория: <b>Реклама / спам</b>\nОценка FastText: <b>{toxic_score * 100:.1f}%</b>\n"
     else:
         details = (
-            f"Нарушений за 1 час: <b>{count}/{VIOLATION_THRESHOLD}</b>\n"
+            f"Нарушений за окно: <b>{count}/{VIOLATION_THRESHOLD}</b>\n"
             f"Категория: <b>{html.escape(category)}</b>\n"
-            f"Оценка Harmony: <b>{toxic_score * 100:.1f}%</b>\n"
+            f"Оценка RU-Toxic-BERT: <b>{toxic_score * 100:.1f}%</b>\n"
         )
 
     text = (
@@ -1085,9 +1082,6 @@ async def _save_violation(
             return
 
         # Проверяем, нет ли уже открытой карточки.
-        # Если карточка существует, НЕ выходим сразу:
-        # проверяем, действует ли автоматический мут. Если мут не был
-        # применён или уже истёк, пробуем применить его повторно.
         pending_rs = await db._exec(
             """
             SELECT alert_id, auto_muted, muted_until, category
@@ -1336,23 +1330,31 @@ async def _process_message(
     if isinstance(toxic_result, dict):
         try:
             classification = int(toxic_result.get("class", 0))
-            toxic_score = _parse_score(toxic_result.get("toxic_score", 0))
-            if classification == 1 and toxic_score >= MIN_TOXIC_SCORE:
+            toxic_score = _parse_score(
+                toxic_result.get("toxic_score", toxic_result.get("score", 0))
+            )
+            # class == 1 у RU-Toxic-BERT означает лишь "токсично":
+            # мат, сленг и пошлые шутки тоже дают class 1.
+            # Решение принимаем ТОЛЬКО по score, а class пишем в лог.
+            if toxic_score >= MIN_TOXIC_SCORE:
                 categories.append("TOXIC")
                 scores.append(toxic_score)
             logger.info(
-                "Harmony: user=%s message=%s class=%s toxic=%.2f%% latency=%s",
+                "RU-Toxic-BERT: user=%s message=%s class=%s toxic=%.2f%% threshold=%.2f%% latency=%s",
                 message.from_user.id, message.message_id, classification,
-                toxic_score * 100, toxic_result.get("latency_ms"),
+                toxic_score * 100, MIN_TOXIC_SCORE * 100,
+                toxic_result.get("latency_ms"),
             )
         except (TypeError, ValueError):
-            logger.warning("Invalid Harmony result: %r", toxic_result)
+            logger.warning("Invalid RU-Toxic-BERT result: %r", toxic_result)
     elif isinstance(toxic_result, BaseException):
         logger.error("Toxicity classifier task failed: %s", toxic_result)
 
     if isinstance(spam_result, dict):
         spam_score = _parse_score(spam_result.get("spam_score", 0))
-        is_spam = bool(spam_result.get("is_spam")) or spam_score >= MIN_SPAM_SCORE
+        # Флаг is_spam от FastText ИГНОРИРУЕМ: решение только по score,
+        # иначе бот банит при is_spam=true независимо от порога.
+        is_spam = spam_score >= MIN_SPAM_SCORE
         logger.info(
             "FastText spam: user=%s message=%s spam=%s score=%.2f%% threshold=%.2f%% latency=%s",
             message.from_user.id, message.message_id, is_spam,
@@ -1389,8 +1391,7 @@ async def check_message(
     context: ContextTypes.DEFAULT_TYPE,
 ) -> None:
     """
-    Каждое текстовое сообщение и подпись отправляются в очередь Harmony.
-    Команды также проверяются, если они попадают в этот handler.
+    Каждое текстовое сообщение и подпись отправляются в очередь классификатора.
     """
 
     message = update.effective_message
@@ -1439,10 +1440,17 @@ async def check_message(
     ]
     current_line = f"ТЕКУЩЕЕ СООБЩЕНИЕ ({current_name}): {text[:550]}"
     context_text = (
-        "Оценивай текущее сообщение с учётом переписки. "
-        "Мат, сленг, пошлые шутки, взаимные подколы и обсуждение 18+ "
-        "не являются нарушением сами по себе. Нарушение — направленная "
-        "агрессия, унижение, травля, угрозы или эскалация реального конфликта.\n"
+        "Ты — модератор подросткового чата. Твоя задача — отличать реальную "
+        "травлю и агрессию от обычного общения. "
+        "НЕ считай нарушением: мат, сленг, пошлые шутки, обсуждение 18+, "
+        "взаимные подколы, дружеские оскорбления, капс, эмоциональные "
+        "восклицания. "
+        "Нарушение — это НАПРАВЛЕННАЯ агрессия: унижение конкретного "
+        "человека, травля, угрозы, пожелания смерти/болезней, "
+        "систематические оскорбления одного участника, эскалация реального "
+        "конфликта. "
+        "Одиночное токсичное сообщение без ответа/эскалации — НЕ нарушение. "
+        "Если сомневаешься — считай, что нарушения нет.\n"
         + current_line
         + ("\nПредыдущие сообщения:\n" + "\n".join(previous_lines) if previous_lines else "")
     )[:MAX_TEXT_LENGTH]
@@ -1461,7 +1469,7 @@ async def check_message(
         )
 
         logger.debug(
-            "Message queued for Harmony: user=%s message=%s queue=%s",
+            "Message queued for classifier: user=%s message=%s queue=%s",
             user.id,
             message.message_id,
             _queue.qsize(),
@@ -1599,23 +1607,23 @@ async def _prepare_media_images(message, bot) -> tuple[list[tuple[str, bytes]], 
             return [("animated_sticker.jpg", frame)], "анимированный стикер"
         if sticker.is_video:
             frames = await asyncio.to_thread(_video_frames, raw)
-            return frames, "видеостикер (5 кадров)"
+            return frames, "видеостикер"
         return [("sticker.jpg", await asyncio.to_thread(_compress_image_bytes, raw))], "стикер"
 
     if message.video:
         raw = await _download_telegram_file(bot, message.video.file_id)
         frames = await asyncio.to_thread(_video_frames, raw)
-        return frames, "видео (5 кадров)"
+        return frames, "видео"
 
     if message.video_note:
         raw = await _download_telegram_file(bot, message.video_note.file_id)
         frames = await asyncio.to_thread(_video_frames, raw)
-        return frames, "видеосообщение (5 кадров)"
+        return frames, "видеосообщение"
 
     if message.animation:
         raw = await _download_telegram_file(bot, message.animation.file_id)
         frames = await asyncio.to_thread(_video_frames, raw)
-        return frames, "анимация (5 кадров)"
+        return frames, "анимация"
 
     return [], "медиа"
 
@@ -1646,12 +1654,12 @@ async def _process_media_message(message, bot) -> None:
             except (TypeError, ValueError):
                 score = 0.0
             category_scores[candidate] = max(category_scores[candidate], score)
-        if label in ("NSFL", "NSFW") or item.get("violation") is True:
-            detected_categories.add(label if label in ("NSFL", "NSFW") else "NSFW")
-
-    # Совместимость с сервером, который возвращает общий флаг violation.
-    if result.get("violation") and not detected_categories:
-        detected_categories.add("NSFW")
+        # Решение только по явной метке и уверенности >= MIN_MEDIA_SCORE.
+        # Флаг item.violation игнорируем — он срабатывает без score.
+        if label in ("NSFL", "NSFW"):
+            score = category_scores[label]
+            if score >= MIN_MEDIA_SCORE:
+                detected_categories.add(label)
 
     if not detected_categories:
         logger.info(
@@ -1660,12 +1668,10 @@ async def _process_media_message(message, bot) -> None:
         )
         return
 
-    # Если модель нашла обе категории, сохраняем более тяжёлую как основную,
-    # но reason summary покажет обе категории из таблицы.
     category = "+".join(sorted(detected_categories))
     score = max((category_scores.get(item, 0.0) for item in detected_categories), default=0.0)
     if score <= 0:
-        score = 0.99
+        score = MIN_MEDIA_SCORE
     media_type = "photo" if message.photo else ("sticker" if message.sticker else "video")
     excerpt = f"{category}: {media_name} — обнаружен небезопасный контент"
     if message.caption:
@@ -1687,6 +1693,7 @@ async def _process_media_message(message, bot) -> None:
         "Unsafe media violation: category=%s user=%s message=%s kind=%s",
         category, message.from_user.id, message.message_id, media_name,
     )
+
 
 async def check_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     message = update.effective_message
@@ -1714,7 +1721,6 @@ async def check_media(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
     except asyncio.QueueFull:
         _queued_media.discard(key)
         logger.warning("Media moderation queue full; skipped message=%s", message.message_id)
-
 
 
 # ============================================================
@@ -1828,7 +1834,7 @@ async def moderation_callback(
                         """,
                         [chat_id, user_id, int(time.time()) - WINDOW_SECONDS],
                     )
-                    # Если одновременно накоплено 3 токсичных нарушения,
+                    # Если одновременно накоплено достаточно токсичных нарушений,
                     # не снимаем мут, несмотря на отмену спам-срабатывания.
                     if auto_muted and (not remaining_toxic.rows or int(remaining_toxic.rows[0][0] or 0) < VIOLATION_THRESHOLD):
                         await context.bot.restrict_chat_member(
@@ -1862,7 +1868,7 @@ async def moderation_callback(
 
                 result_text = (
                     "❌ Администратор отменил срабатывание. "
-                    + ("Удалено только это спам-срабатывание." if "SPAM" in alert_category.split("+") else "Нарушения за последний час очищены.")
+                    + ("Удалено только это спам-срабатывание." if "SPAM" in alert_category.split("+") else "Нарушения за последнее окно очищены.")
                 )
 
             elif action == "ban":
