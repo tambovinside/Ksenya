@@ -70,6 +70,44 @@ CBR_URL = "https://www.cbr.ru/scripts/XML_daily.asp"
 COINPAPRIKA_URL = "https://api.coinpaprika.com/v1/tickers"
 EXCHANGERATE_URL = "https://open.er-api.com/v6/latest/USD"
 
+
+# Валюты, доступные в командах «Курс евро», «Курс юань» и т. д.
+# Все цены показываются в рублях за 1 единицу иностранной валюты.
+FIAT_CURRENCIES = {
+    "USD": ("Доллар США", "💵", ["usd", "доллар", "доллары", "доллар сша", "бакс"]),
+    "EUR": ("Евро", "💶", ["eur", "евро"]),
+    "CNY": ("Китайский юань", "🇨🇳", ["cny", "rmb", "юань", "юани", "китайский юань"]),
+    "AED": ("Дирхам ОАЭ", "🇦🇪", ["aed", "дирхам", "дирхам оаэ", "дирхам эмиратов"]),
+    "KZT": ("Казахстанский тенге", "🇰🇿", ["kzt", "тенге"]),
+    "GBP": ("Фунт стерлингов", "💷", ["gbp", "фунт", "фунт стерлингов", "фунты"]),
+    "CHF": ("Швейцарский франк", "🇨🇭", ["chf", "франк", "швейцарский франк"]),
+    "JPY": ("Японская иена", "🇯🇵", ["jpy", "иена", "йена"]),
+    "TRY": ("Турецкая лира", "🇹🇷", ["try", "лира", "турецкая лира"]),
+    "INR": ("Индийская рупия", "🇮🇳", ["inr", "рупия", "индийская рупия"]),
+    "BYN": ("Белорусский рубль", "🇧🇾", ["byn", "белорусский рубль", "белрубль"]),
+    "CAD": ("Канадский доллар", "🇨🇦", ["cad", "канадский доллар"]),
+    "AUD": ("Австралийский доллар", "🇦🇺", ["aud", "австралийский доллар"]),
+    "SGD": ("Сингапурский доллар", "🇸🇬", ["sgd", "сингапурский доллар"]),
+    "HKD": ("Гонконгский доллар", "🇭🇰", ["hkd", "гонконгский доллар"]),
+    "KRW": ("Южнокорейская вона", "🇰🇷", ["krw", "вона", "корейская вона"]),
+    "PLN": ("Польский злотый", "🇵🇱", ["pln", "злотый", "злотые"]),
+    "CZK": ("Чешская крона", "🇨🇿", ["czk", "чешская крона"]),
+    "SEK": ("Шведская крона", "🇸🇪", ["sek", "шведская крона"]),
+    "NOK": ("Норвежская крона", "🇳🇴", ["nok", "норвежская крона"]),
+    "DKK": ("Датская крона", "🇩🇰", ["dkk", "датская крона"]),
+    "THB": ("Тайский бат", "🇹🇭", ["thb", "бат", "тайский бат"]),
+    "GEL": ("Грузинский лари", "🇬🇪", ["gel", "лари", "грузинский лари"]),
+    "AZN": ("Азербайджанский манат", "🇦🇿", ["azn", "манат", "азербайджанский манат"]),
+    "AMD": ("Армянский драм", "🇦🇲", ["amd", "драм", "армянский драм"]),
+    "UZS": ("Узбекский сум", "🇺🇿", ["uzs", "сум", "узбекский сум"]),
+    "TJS": ("Таджикский сомони", "🇹🇯", ["tjs", "сомони"]),
+}
+FIAT_ALIASES = {
+    alias.casefold(): code
+    for code, (_name, _emoji, aliases) in FIAT_CURRENCIES.items()
+    for alias in aliases
+}
+
 # Резервный источник без API-ключа: CoinPaprika.
 # Сопоставление идёт по тикеру из нашего списка; среди совпадений
 # выбирается актив с наименьшим rank (наиболее крупный/известный).
@@ -108,31 +146,59 @@ async def _request_json(
     raise RuntimeError(f"Не удалось получить данные от {url}: {last_error}") from last_error
 
 
-async def _fetch_usd_rub(client: httpx.AsyncClient) -> float | None:
-    """Сначала ЦБ РФ, затем бесплатный open.er-api.com без ключа."""
+async def _fetch_fiat_rates(client: httpx.AsyncClient) -> dict[str, float]:
+    """
+    Возвращает стоимость 1 единицы валюты в RUB.
+    Сначала использует XML Банка России, затем дополняет пропуски
+    бесплатным open.er-api.com без API-ключа.
+    """
+    rates: dict[str, float] = {}
+
+    # Основной источник — ежедневный XML Банка России.
     try:
         response = await client.get(CBR_URL)
         response.raise_for_status()
         root = ET.fromstring(response.content)
         for item in root.findall("Valute"):
-            if item.findtext("CharCode") == "USD":
-                nominal = float(item.findtext("Nominal", "1").replace(",", "."))
-                value = float(item.findtext("Value", "0").replace(",", "."))
-                if nominal > 0 and value > 0:
-                    return value / nominal
+            code = (item.findtext("CharCode") or "").upper()
+            if code not in FIAT_CURRENCIES:
+                continue
+            nominal = float((item.findtext("Nominal") or "1").replace(",", "."))
+            value = float((item.findtext("Value") or "0").replace(",", "."))
+            if nominal > 0 and value > 0:
+                rates[code] = value / nominal
+        # ЦБ РФ публикует рублёвые котировки напрямую.
+        if "USD" in rates:
+            logger.info("Курсы валют получены от Банка России: %s валют", len(rates))
     except Exception as exc:
-        logger.warning("ЦБ РФ временно недоступен: %s", exc)
+        logger.warning("Банк России временно недоступен: %s", exc)
 
+    # Бесплатный резервный источник; дополняем только отсутствующие валюты.
     try:
         payload = await _request_json(client, EXCHANGERATE_URL)
-        rate = (payload.get("rates") or {}).get("RUB") if isinstance(payload, dict) else None
-        rate = float(rate)
-        if rate > 0:
-            logger.info("USD/RUB получен через open.er-api.com")
-            return rate
+        usd_quotes = payload.get("rates", {}) if isinstance(payload, dict) else {}
+        usd_rub = rates.get("USD")
+        if not usd_rub:
+            usd_rub = float(usd_quotes.get("RUB") or 0)
+            if usd_rub > 0:
+                rates["USD"] = usd_rub
+
+        if usd_rub > 0:
+            for code in FIAT_CURRENCIES:
+                if code in rates:
+                    continue
+                units_per_usd = usd_quotes.get(code)
+                try:
+                    units_per_usd = float(units_per_usd)
+                except (TypeError, ValueError):
+                    continue
+                if units_per_usd > 0:
+                    rates[code] = usd_rub / units_per_usd
+            logger.info("Резервный API валют обработан; доступно %s валют", len(rates))
     except Exception as exc:
-        logger.warning("Резервный источник USD/RUB недоступен: %s", exc)
-    return None
+        logger.warning("Резервный источник валют недоступен: %s", exc)
+
+    return rates
 
 
 async def _fetch_coinpaprika(client: httpx.AsyncClient, usd_rub: float) -> dict:
@@ -189,7 +255,8 @@ async def _fetch_rates() -> tuple[float, dict]:
         headers={"User-Agent": "TelegramCryptoRatesBot/2.0"},
         follow_redirects=True,
     ) as client:
-        usd_rub = await _fetch_usd_rub(client)
+        fiat_rates = await _fetch_fiat_rates(client)
+        usd_rub = fiat_rates.get("USD")
 
         try:
             crypto_data = await _fetch_coingecko(client)
@@ -198,6 +265,7 @@ async def _fetch_rates() -> tuple[float, dict]:
             logger.warning("CoinGecko недоступен: %s; пробую CoinPaprika", primary_error)
             if not usd_rub and _LAST_GOOD_RATES:
                 usd_rub = _LAST_GOOD_RATES[0]
+                fiat_rates = dict(_LAST_GOOD_RATES[1].get("_fiat", {}))
             if not usd_rub:
                 raise RuntimeError(
                     "Не удалось получить USD/RUB ни от ЦБ, ни от open.er-api.com"
@@ -222,8 +290,14 @@ async def _fetch_rates() -> tuple[float, dict]:
 
     if not usd_rub and _LAST_GOOD_RATES:
         usd_rub = _LAST_GOOD_RATES[0]
+        if not fiat_rates:
+            fiat_rates = dict(_LAST_GOOD_RATES[1].get("_fiat", {}))
     if not usd_rub:
         raise RuntimeError("Не удалось определить курс USD/RUB")
+
+    # Добавляем USD/RUB в общий набор и сохраняем котировки валют в данных.
+    fiat_rates.setdefault("USD", float(usd_rub))
+    crypto_data["_fiat"] = fiat_rates
 
     # CoinPaprika отдаёт USD; для него пересчёт в RUB уже сделан выше.
     # CoinGecko обычно отдаёт обе валюты, но заполняем RUB, если её нет.
@@ -237,12 +311,21 @@ async def _fetch_rates() -> tuple[float, dict]:
 
 
 def _format_rates_text(usd_rub: float, data: dict) -> str:
+    fiat_rates = data.get("_fiat", {})
     lines = [
         "📊 <b>КУРСЫ ВАЛЮТ И КРИПТОВАЛЮТ</b>",
-        f"💵 <b>Доллар США:</b> 1 USD = <b>{_money(usd_rub)} ₽</b>",
         "",
-        f"🪙 <b>Криптовалюты к рублю ({len(COINS)} монет)</b>",
+        "💱 <b>ИНОСТРАННЫЕ ВАЛЮТЫ К РУБЛЮ</b>",
     ]
+    for code, (name, emoji, _aliases) in FIAT_CURRENCIES.items():
+        value = fiat_rates.get(code)
+        if value is not None:
+            lines.append(f"{emoji} <b>{code}</b> ({name}): {_money(float(value))} ₽")
+
+    lines.extend([
+        "",
+        f"🪙 <b>КРИПТОВАЛЮТЫ К РУБЛЮ ({len(COINS)} монет)</b>",
+    ])
     for coin_id, (ticker, _en_name, ru_name, _aliases) in COINS.items():
         price = data.get(coin_id, {}).get("rub")
         if price is None:
@@ -252,9 +335,10 @@ def _format_rates_text(usd_rub: float, data: dict) -> str:
 
     lines.extend([
         "",
-        "<i>Источники: CoinGecko / CoinPaprika, Банк России / open.er-api.com</i>",
+        "<i>Источники валют: Банк России / open.er-api.com</i>",
+        "<i>Источники криптовалют: CoinGecko / CoinPaprika</i>",
         "⏰ Обновление ежедневно в 15:30 МСК",
-        "Для отдельной монеты напиши: <code>Курс биткоин</code> или <code>Курс ETH</code>",
+        "Отдельный курс: <code>Курс евро</code>, <code>Курс юань</code>, <code>Курс BTC</code>",
     ])
     return "\n".join(lines)
 
@@ -287,9 +371,19 @@ async def cmd_rates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         return
 
     key = query.casefold().strip().replace("$", "")
-    if key in ("доллар", "доллары", "usd", "доллар сша", "рубль", "доллар в рубли"):
+    fiat_code = FIAT_ALIASES.get(key)
+    if fiat_code:
+        fiat_rates = data.get("_fiat", {})
+        value = fiat_rates.get(fiat_code)
+        if value is None:
+            await message.reply_text(
+                f"⚠️ Сейчас нет данных по валюте {fiat_code}. Попробуй позже."
+            )
+            return
+        name, emoji, _aliases = FIAT_CURRENCIES[fiat_code]
         await message.reply_text(
-            f"💵 <b>Курс доллара</b>\n1 USD = <b>{_money(usd_rub)} ₽</b>",
+            f"{emoji} <b>Курс: {name} ({fiat_code})</b>\n"
+            f"1 {fiat_code} = <b>{_money(float(value))} ₽</b>",
             parse_mode=ParseMode.HTML,
         )
         return
@@ -298,9 +392,11 @@ async def cmd_rates(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if not coin_id:
         available = ", ".join(item[0] for item in COINS.values())
         await message.reply_text(
-            "❓ Не распознал монету.\n"
-            f"Доступные тикеры: {available}\n"
-            "Пример: <code>Курс BTC</code>, <code>Курс биткоин</code>, <code>Курс эфир</code>",
+            "❓ Не распознал валюту или монету.\n"
+            "Валюты: USD, EUR, CNY, AED, KZT, GBP, CHF, JPY и другие.\n"
+            f"Криптовалюты: {available}\n"
+            "Примеры: <code>Курс евро</code>, <code>Курс тенге</code>, "
+            "<code>Курс BTC</code>, <code>Курс биткоин</code>",
             parse_mode=ParseMode.HTML,
         )
         return
