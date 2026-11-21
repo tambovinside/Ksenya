@@ -34,7 +34,6 @@ import db
 logger = logging.getLogger("moderai")
 
 API_URL = "https://tambovinside.onrender.com/check"
-SPAM_API_URL = "https://tambovinside.onrender.com/check-spam"
 IMAGE_API_URL = "https://tambovinside.onrender.com/check-image"
 
 API_TOKEN = os.getenv("AImoder", "").strip()
@@ -46,9 +45,6 @@ ADMIN_MENTION = "@YouWarm"
 
 VIOLATION_THRESHOLD = int(os.getenv("VIOLATION_THRESHOLD", "3") or 3)
 MIN_TOXIC_SCORE = 0.85
-
-_spam_env = os.getenv("SPAM_THRESHOLD")
-MIN_SPAM_SCORE = float(_spam_env or "0.92")
 
 _media_env = os.getenv("MEDIA_THRESHOLD")
 MIN_MEDIA_SCORE = float(_media_env or "0.88")
@@ -75,7 +71,6 @@ WARMUP_TIMEOUT_READ = 140
 
 MAX_PARALLEL_REQUESTS = 4
 MAX_TOXIC_PARALLEL = 4
-MAX_SPAM_PARALLEL = 4
 MAX_IMAGE_PARALLEL = 1
 
 MAX_QUEUE_SIZE = 1000
@@ -85,36 +80,7 @@ MAX_TEXT_LENGTH = 1000
 CONTEXT_MESSAGES = 6
 MAX_MEDIA_BYTES = 20 * 1024 * 1024
 
-IMMEDIATE_CATEGORIES = {"SPAM", "NSFL", "NSFW"}
-
-_SPAM_PATTERNS = [
-    r"https?://\S+",
-    r"t\.me/(\+|joinchat)",
-    r"t\.me/[A-Za-z0-9_]{4,}",
-    r"(?<![\w@])@[A-Za-z0-9_]{5,}",
-    r"подпис\w*\s+(на|в)\s+(канал|чат|группу|телеграм|тг|tg)",
-    r"\b(реклам|реклама|рекламу|spam|спам)\w*",
-    r"\b(казин|ставк|букмекер|бинарн|форекс)\w*",
-    r"\b(крипт|биткоин|bitcoin|usdt|toncoin)\w*",
-    r"(заработ|заработок|доход)\s+(от|до)\s+\d",
-    r"перейди\s+по\s+ссылке",
-    r"\b(инвестиц|пассивн\w+\s+доход)\w*",
-    r"бесплатн\w+\s+(деньги|биткоин|крипт)",
-]
-
-_TOXIC_PATTERNS = [
-    r"\b(хуй|хуя|хуё|хуе|хуи|пизд|бляд|блят|ебал|ебан|еба|ебуч|залуп)\w*",
-    r"\b(мудак|мудил|пидор|пидар|гандон|долбоёб|долбоеб|уёбок|уебок)\w*",
-    r"\b(соси|сосите|сосать|отсоси)\b",
-    r"\b(изгой|изгои|чмо|лох|лохи|дебил|дебилы|идиот|идиоты|кретин|кретины)\b",
-    r"\b(сдохни|сдохните|умри|умрите|повесься|удавись)\b",
-    r"\b(гавно|говно|дерьмо|помои|помойка)\b",
-    r"\b(нахуй|нахуя|нихуя|похуй)\b",
-    r"(русская\s+свинка|свинья\s+русская)",
-]
-
-_SPAM_REGEX = [re.compile(p, re.IGNORECASE) for p in _SPAM_PATTERNS]
-_TOXIC_REGEX = [re.compile(p, re.IGNORECASE) for p in _TOXIC_PATTERNS]
+IMMEDIATE_CATEGORIES = {"NSFL", "NSFW"}
 
 _SAFE_CONTEXT_PATTERNS = [
     r"\b(пляж|пляжный|пляже|пляжем|beach|pool|бассейн|бассейне)\b",
@@ -124,40 +90,6 @@ _SAFE_CONTEXT_PATTERNS = [
     r"\b(манекен|манекенщиц|модель|подиум|fashion|мода|показ)\b",
 ]
 _SAFE_CONTEXT_REGEX = [re.compile(p, re.IGNORECASE) for p in _SAFE_CONTEXT_PATTERNS]
-
-
-def _strip_mentions(text: str) -> str:
-    return re.sub(r"(?<![\w@])@[A-Za-z0-9_]{5,}", " ", text)
-
-
-def _heuristic_spam(text: str) -> bool:
-    cleaned = _strip_mentions(text)
-    if len(cleaned.strip()) < 4:
-        return False
-    spam_hits = sum(1 for rx in _SPAM_REGEX if rx.search(cleaned))
-    if spam_hits == 0:
-        return False
-    if re.search(r"https?://\S+", cleaned):
-        return True
-    if re.search(r"t\.me/(\+|joinchat|[A-Za-z0-9_]{4,})", cleaned, re.IGNORECASE):
-        return True
-    if re.search(r"подпис\w*\s+(на|в)\s+(канал|чат|группу|телеграм|тг|tg)", cleaned, re.IGNORECASE):
-        return True
-    if re.search(r"\b(казин|ставк|букмекер|бинарн|форекс)\w*", cleaned, re.IGNORECASE):
-        return True
-    if re.search(r"\b(крипт|биткоин|bitcoin|usdt|toncoin)\w*", cleaned, re.IGNORECASE):
-        return True
-    if re.search(r"(заработ|заработок|доход)\s+(от|до)\s+\d", cleaned, re.IGNORECASE):
-        return True
-    if re.search(r"перейди\s+по\s+ссылке", cleaned, re.IGNORECASE):
-        return True
-    if spam_hits >= 2:
-        return True
-    return False
-
-
-def _heuristic_toxic(text: str) -> bool:
-    return any(rx.search(text) for rx in _TOXIC_REGEX)
 
 
 def _has_safe_context(text: str) -> bool:
@@ -179,7 +111,6 @@ _media_worker: asyncio.Task | None = None
 _session: aiohttp.ClientSession | None = None
 
 _toxic_semaphore = asyncio.Semaphore(MAX_TOXIC_PARALLEL)
-_spam_semaphore = asyncio.Semaphore(MAX_SPAM_PARALLEL)
 _image_semaphore = asyncio.Semaphore(MAX_IMAGE_PARALLEL)
 
 _user_locks: dict[tuple[int, int], asyncio.Lock] = {}
@@ -343,21 +274,18 @@ async def init_db() -> None:
             "AImoder отсутствует в Render Environment. AI-модерация выключена."
         )
     else:
-        if _spam_env:
-            logger.info("SPAM_THRESHOLD env=%s overrides default 0.92", _spam_env)
         if _media_env:
             logger.info("MEDIA_THRESHOLD env=%s overrides default 0.88", _media_env)
         if _media_nsfl_env:
             logger.info("MEDIA_NSFL_THRESHOLD env=%s overrides default 0.82", _media_nsfl_env)
         logger.info(
             "Ksenya AI Security initialized: chat=%s threshold=%s window=%s "
-            "workers=%s toxic=%s spam=%s media=%s nsfl=%s heuristics=on",
+            "workers=%s toxic=%s media=%s nsfl=%s text_ai=on",
             CHAT_ID,
             VIOLATION_THRESHOLD,
             WINDOW_SECONDS,
             MAX_PARALLEL_REQUESTS,
             MIN_TOXIC_SCORE,
-            MIN_SPAM_SCORE,
             MIN_MEDIA_SCORE,
             MIN_MEDIA_NSFL_SCORE,
         )
@@ -446,7 +374,7 @@ async def _get_session() -> aiohttp.ClientSession:
             sock_read=SOCK_READ_TIMEOUT_SECONDS,
         )
         connector = aiohttp.TCPConnector(
-            limit=MAX_TOXIC_PARALLEL + MAX_SPAM_PARALLEL + MAX_IMAGE_PARALLEL + 2,
+            limit=MAX_TOXIC_PARALLEL + MAX_IMAGE_PARALLEL + 2,
             ttl_dns_cache=300,
             enable_cleanup_closed=True,
         )
@@ -509,13 +437,6 @@ async def close() -> None:
 
 def _extract_toxic_score(result: dict) -> float:
     for key in ("toxic_score", "score", "confidence", "probability", "toxic"):
-        if key in result:
-            return _parse_score(result[key])
-    return 0.0
-
-
-def _extract_spam_score(result: dict) -> float:
-    for key in ("spam_score", "score", "confidence", "probability", "spam"):
         if key in result:
             return _parse_score(result[key])
     return 0.0
@@ -663,35 +584,6 @@ async def _classify(text: str) -> dict[str, Any] | None:
     return None
 
 
-async def _classify_spam(text: str) -> dict[str, Any] | None:
-    if not API_TOKEN:
-        return None
-    session = await _get_session()
-    headers = {"X-API-Token": API_TOKEN}
-    payload = {"text": text[:MAX_TEXT_LENGTH]}
-    async with _spam_semaphore:
-        try:
-            async with session.post(
-                SPAM_API_URL, json=payload, headers=headers
-            ) as response:
-                if response.status != 200:
-                    body = (await response.text())[:300]
-                    logger.warning("FastText spam HTTP %s: %s", response.status, body)
-                    return None
-                result = await response.json(content_type=None)
-                if not isinstance(result, dict):
-                    logger.warning("FastText spam invalid JSON: %r", result)
-                    return None
-                return result
-        except asyncio.TimeoutError:
-            logger.warning("FastText spam request timeout")
-        except (aiohttp.ClientError, ValueError):
-            logger.exception("FastText spam request failed")
-        except Exception:
-            logger.exception("Unexpected FastText spam error")
-    return None
-
-
 async def _classify_images(images: list[tuple[str, bytes]]) -> dict[str, Any] | None:
     if not API_TOKEN or not images:
         return None
@@ -833,8 +725,6 @@ async def _get_violation_reason(chat_id: int, user_id: int) -> str:
         labels.append("NSFW — сексуальный контент или нагота")
     if "TOXIC" in categories:
         labels.append("оскорбления или травля")
-    if "SPAM" in categories:
-        labels.append("реклама или спам")
     return "; ".join(labels) if labels else "нарушение правил сообщества"
 
 
@@ -906,15 +796,10 @@ async def _notify_admin(
     )
 
     parts = _split_categories(category)
-    if "SPAM" in parts:
+    if parts & {"NSFL", "NSFW"}:
         details = (
-            "Категория: <b>Реклама / спам</b>\n"
-            f"Оценка: <b>{toxic_score * 100:.1f}%</b>\n"
-        )
-    elif parts & {"NSFL", "NSFW"}:
-        details = (
-            f"Категория: <b>{html.escape(category)}</b>\n"
-            f"Оценка image-классификатора: <b>{toxic_score * 100:.1f}%</b>\n"
+            f"Категория: <b>{html.escape(category)}</b>\\n"
+            f"Оценка image-классификатора: <b>{toxic_score * 100:.1f}%</b>\\n"
         )
     else:
         details = (
@@ -1028,27 +913,17 @@ async def _handle_immediate_action(
 
     reason = await _get_violation_reason(chat_id, user_id)
     user_link = f'<a href="tg://user?id={user_id}">Участник</a>'
-    parts = _split_categories(category)
-    if "SPAM" in parts:
-        if auto_muted:
-            text = f"🔇 {user_link} получил мут на 24 часа за рекламу или спам."
-        else:
-            text = (
-                f"⚠️ У {user_link} обнаружена реклама или спам, "
-                "но автоматический мут не применился. Администратор уведомлён."
-            )
+    if auto_muted:
+        text = (
+            f"🔇 {user_link} получил мут на 24 часа. "
+            f"Причина: {html.escape(reason)}."
+        )
     else:
-        if auto_muted:
-            text = (
-                f"🔇 {user_link} получил мут на 24 часа. "
-                f"Причина: {html.escape(reason)}."
-            )
-        else:
-            text = (
-                f"⚠️ У {user_link} обнаружено нарушение "
-                f"({html.escape(reason)}), но автоматический мут не применился. "
-                "Администратор уведомлён."
-            )
+        text = (
+            f"⚠️ У {user_link} обнаружено нарушение "
+            f"({html.escape(reason)}), но автоматический мут не применился. "
+            "Администратор уведомлён."
+        )
     if not deleted:
         text += "\nНе удалось удалить нарушающее сообщение — проверьте права бота."
     try:
@@ -1319,7 +1194,6 @@ async def _save_violation(
             """
             SELECT COUNT(*) FROM ai_moderation_violations
             WHERE chat_id=? AND user_id=? AND created_at>=?
-              AND category NOT LIKE '%SPAM%'
               AND category NOT LIKE '%NSFL%'
               AND category NOT LIKE '%NSFW%'
             """,
@@ -1352,87 +1226,35 @@ async def _save_violation(
 
 
 async def _process_message(message, bot, context_text: str = "") -> None:
+    """Проверяет текст только на токсичность; спам-классификация отключена."""
     text = (message.text or message.caption or "").strip()
     if not text or not message.from_user:
         return
 
-    heuristic_spam = _heuristic_spam(text)
-    heuristic_toxic = _heuristic_toxic(text)
+    model_input = context_text or text
+    toxic_result = await _classify(model_input)
 
-    if heuristic_spam:
-        logger.warning(
-            "HEURISTIC SPAM: user=%s message=%s text=%r",
-            message.from_user.id, message.message_id, text[:200],
-        )
-        await _save_violation(
-            bot=bot,
-            chat_id=message.chat_id,
-            user_id=message.from_user.id,
-            message_id=message.message_id,
-            message_text=text,
-            toxic_score=0.99,
-            first_name=message.from_user.first_name or "Пользователь",
-            username=message.from_user.username,
-            category="SPAM",
-        )
+    if not isinstance(toxic_result, dict):
+        if isinstance(toxic_result, BaseException):
+            logger.error("Toxicity task failed: %s", toxic_result)
         return
 
-    model_input = context_text or text
-    toxic_result, spam_result = await asyncio.gather(
-        _classify(model_input),
-        _classify_spam(text),
-        return_exceptions=True,
-    )
+    try:
+        classification = int(toxic_result.get("class", 0))
+        toxic_score = _extract_toxic_score(toxic_result)
 
-    categories: list[str] = []
-    scores: list[float] = []
-
-    if isinstance(toxic_result, dict):
-        try:
-            classification = int(toxic_result.get("class", 0))
-            toxic_score = _extract_toxic_score(toxic_result)
-
-            if heuristic_toxic and toxic_score < MIN_TOXIC_SCORE:
-                logger.warning(
-                    "HEURISTIC TOXIC BOOST: user=%s message=%s model=%.2f%% -> 0.99",
-                    message.from_user.id, message.message_id, toxic_score * 100,
-                )
-                toxic_score = 0.99
-
-            if toxic_score >= MIN_TOXIC_SCORE:
-                categories.append("TOXIC")
-                scores.append(toxic_score)
-            logger.info(
-                "RU-Toxic-BERT: user=%s message=%s class=%s toxic=%.2f%% "
-                "threshold=%.2f%% latency=%s",
-                message.from_user.id, message.message_id, classification,
-                toxic_score * 100, MIN_TOXIC_SCORE * 100,
-                toxic_result.get("latency_ms"),
-            )
-        except (TypeError, ValueError):
-            logger.warning("Invalid RU-Toxic-BERT result: %r", toxic_result)
-    elif isinstance(toxic_result, BaseException):
-        logger.error("Toxicity task failed: %s", toxic_result)
-
-    if isinstance(spam_result, dict):
-        spam_score = _extract_spam_score(spam_result)
-        if heuristic_spam and spam_score < MIN_SPAM_SCORE:
-            spam_score = 0.99
-        is_spam = spam_score >= MIN_SPAM_SCORE
         logger.info(
-            "FastText spam: user=%s message=%s spam=%s score=%.2f%% "
+            "RU-Toxic-BERT: user=%s message=%s class=%s toxic=%.2f%% "
             "threshold=%.2f%% latency=%s",
-            message.from_user.id, message.message_id, is_spam,
-            spam_score * 100, MIN_SPAM_SCORE * 100,
-            spam_result.get("latency_ms"),
+            message.from_user.id, message.message_id, classification,
+            toxic_score * 100, MIN_TOXIC_SCORE * 100,
+            toxic_result.get("latency_ms"),
         )
-        if is_spam:
-            categories.append("SPAM")
-            scores.append(spam_score)
-    elif isinstance(spam_result, BaseException):
-        logger.error("Spam task failed: %s", spam_result)
+    except (TypeError, ValueError):
+        logger.warning("Invalid RU-Toxic-BERT result: %r", toxic_result)
+        return
 
-    if not categories:
+    if toxic_score < MIN_TOXIC_SCORE:
         return
 
     await _save_violation(
@@ -1441,10 +1263,10 @@ async def _process_message(message, bot, context_text: str = "") -> None:
         user_id=message.from_user.id,
         message_id=message.message_id,
         message_text=text,
-        toxic_score=max(scores, default=0.0),
+        toxic_score=toxic_score,
         first_name=message.from_user.first_name or "Пользователь",
         username=message.from_user.username,
-        category="+".join(sorted(set(categories))),
+        category="TOXIC",
     )
 
 
@@ -1924,42 +1746,17 @@ async def moderation_callback(
 
         try:
             if action == "wrong":
-                if "SPAM" in alert_parts and alert_message_id is not None:
-                    await db._exec(
-                        "DELETE FROM ai_moderation_violations "
-                        "WHERE chat_id=? AND message_id=?",
-                        [chat_id, int(alert_message_id)],
+                if auto_muted:
+                    await context.bot.restrict_chat_member(
+                        chat_id=chat_id,
+                        user_id=user_id,
+                        permissions=_permissions_unmuted(),
                     )
-                    remaining = await db._exec(
-                        "SELECT COUNT(*) FROM ai_moderation_violations "
-                        "WHERE chat_id=? AND user_id=? AND created_at>=? "
-                        "AND category NOT LIKE '%SPAM%' "
-                        "AND category NOT LIKE '%NSFL%' "
-                        "AND category NOT LIKE '%NSFW%'",
-                        [chat_id, user_id, int(time.time()) - WINDOW_SECONDS],
-                    )
-                    if auto_muted and (
-                        not remaining.rows
-                        or int(remaining.rows[0][0] or 0) < VIOLATION_THRESHOLD
-                    ):
-                        await context.bot.restrict_chat_member(
-                            chat_id=chat_id,
-                            user_id=user_id,
-                            permissions=_permissions_unmuted(),
-                        )
-                else:
-                    if auto_muted:
-                        await context.bot.restrict_chat_member(
-                            chat_id=chat_id,
-                            user_id=user_id,
-                            permissions=_permissions_unmuted(),
-                        )
-                    await db._exec(
-                        "DELETE FROM ai_moderation_violations "
-                        "WHERE chat_id=? AND user_id=? AND created_at>=?",
-                        [chat_id, user_id, int(time.time()) - WINDOW_SECONDS],
-                    )
-
+                await db._exec(
+                    "DELETE FROM ai_moderation_violations "
+                    "WHERE chat_id=? AND user_id=? AND created_at>=?",
+                    [chat_id, user_id, int(time.time()) - WINDOW_SECONDS],
+                )
                 await db._exec(
                     "UPDATE ai_moderation_alerts SET status='false_positive' "
                     "WHERE alert_id=?",
@@ -1967,11 +1764,7 @@ async def moderation_callback(
                 )
                 result_text = (
                     "❌ Администратор отменил срабатывание. "
-                    + (
-                        "Удалено только это спам-срабатывание."
-                        if "SPAM" in alert_parts
-                        else "Нарушения за последнее окно очищены."
-                    )
+                    "Нарушения за последнее окно очищены."
                 )
 
             elif action == "ban":
