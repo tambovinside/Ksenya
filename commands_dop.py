@@ -49,7 +49,6 @@ CREATE_BUY("Разрезать вены", "user1 разрезал(а)  вены 
 CREATE_BUY("Отрезать хуй", "user1 отрезал(а)  хуй user2", pocket=10)
 CREATE_BUY("Поджечь пизду", "user1 зажег(ла) пизду user2", pocket=10)
 CREATE_BUY("Нанести увечья", "user1 нанес(ла) увечия user2", pocket=10)
-CREATE_POCKET("Пак мафиозника", price=9000000, id=99)
-CREATE_BUY("СуперСекс по методикам мафиозника", "user1 сделал(ла) не забываемый секс с user2", pocket=99, marriage_xp=1000000)
+
 
 
