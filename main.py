@@ -618,8 +618,8 @@ def build_app() -> Application:
 
     app.add_error_handler(_error_handler)
 
-    # AI-модерация: отдельная ранняя группа. Текущий handler ставит сообщение
-    # в общую очередь для проверки токсичности и FastText-спама.
+    # AI-модерация: текст проверяется только на токсичность.
+    # Фото, видео, анимации и стикеры отдельно проверяются на NSFW/NSFL.
     if CHAT_ID:
         app.add_handler(
             MessageHandler(
