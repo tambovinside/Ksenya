@@ -1,9 +1,10 @@
 """
 Курсы валют и криптовалют.
 Ежедневная публикация в CHAT_ID в 15:30 по Москве с закреплением.
-Источники: CoinGecko, CoinCap и Банк России.
+Источники: CoinGecko, CoinPaprika, Банк России и open.er-api.com.
 """
 
+import asyncio
 import logging
 import os
 import xml.etree.ElementTree as ET
@@ -66,45 +67,14 @@ ALIASES = {
 
 COINGECKO_URL = "https://api.coingecko.com/api/v3/simple/price"
 CBR_URL = "https://www.cbr.ru/scripts/XML_daily.asp"
-COINCAP_URL = "https://api.coincap.io/v2/assets"
+COINPAPRIKA_URL = "https://api.coinpaprika.com/v1/tickers"
+EXCHANGERATE_URL = "https://open.er-api.com/v6/latest/USD"
 
-# CoinGecko ID -> CoinCap asset ID (для резервного источника).
-COINCAP_IDS = {
-    "bitcoin": "bitcoin",
-    "ethereum": "ethereum",
-    "tether": "tether",
-    "binancecoin": "binance-coin",
-    "solana": "solana",
-    "ripple": "xrp",
-    "usd-coin": "usd-coin",
-    "dogecoin": "dogecoin",
-    "tron": "tron",
-    "cardano": "cardano",
-    "bitcoin-cash": "bitcoin-cash",
-    "chainlink": "chainlink",
-    "stellar": "stellar",
-    "avalanche-2": "avalanche",
-    "shiba-inu": "shiba-inu",
-    "the-open-network": "toncoin",
-    "polkadot": "polkadot",
-    "litecoin": "litecoin",
-    "uniswap": "uniswap",
-    "near": "near-protocol",
-    "aptos": "aptos",
-    "sui": "sui",
-    "internet-computer": "internet-computer",
-    "ethereum-classic": "ethereum-classic",
-    "monero": "monero",
-    "cosmos": "cosmos",
-    "filecoin": "filecoin",
-    "arbitrum": "arbitrum",
-    "optimism": "optimism",
-    "pepe": "pepe",
-    "aave": "aave",
-    "vechain": "vechain",
-    "render-token": "render-token",
-    "hedera-hashgraph": "hedera",
-}
+# Резервный источник без API-ключа: CoinPaprika.
+# Сопоставление идёт по тикеру из нашего списка; среди совпадений
+# выбирается актив с наименьшим rank (наиболее крупный/известный).
+TICKER_TO_COIN_ID = {values[0].upper(): coin_id for coin_id, values in COINS.items()}
+
 
 _LAST_GOOD_RATES: tuple[float, dict] | None = None
 
@@ -117,7 +87,29 @@ def _money(value: float) -> str:
     return f"{value:.8f}".rstrip("0").rstrip(".").replace(".", ",")
 
 
+async def _request_json(
+    client: httpx.AsyncClient,
+    url: str,
+    *,
+    params: dict | None = None,
+    attempts: int = 2,
+) -> dict | list:
+    """Запрос JSON с коротким повтором при временной сетевой ошибке."""
+    last_error = None
+    for attempt in range(attempts):
+        try:
+            response = await client.get(url, params=params)
+            response.raise_for_status()
+            return response.json()
+        except (httpx.HTTPError, ValueError) as exc:
+            last_error = exc
+            if attempt + 1 < attempts:
+                await asyncio.sleep(0.6 * (attempt + 1))
+    raise RuntimeError(f"Не удалось получить данные от {url}: {last_error}") from last_error
+
+
 async def _fetch_usd_rub(client: httpx.AsyncClient) -> float | None:
+    """Сначала ЦБ РФ, затем бесплатный open.er-api.com без ключа."""
     try:
         response = await client.get(CBR_URL)
         response.raise_for_status()
@@ -128,80 +120,98 @@ async def _fetch_usd_rub(client: httpx.AsyncClient) -> float | None:
                 value = float(item.findtext("Value", "0").replace(",", "."))
                 if nominal > 0 and value > 0:
                     return value / nominal
-    except Exception:
-        logger.warning("Не удалось получить курс USD/RUB от ЦБ РФ", exc_info=True)
+    except Exception as exc:
+        logger.warning("ЦБ РФ временно недоступен: %s", exc)
+
+    try:
+        payload = await _request_json(client, EXCHANGERATE_URL)
+        rate = (payload.get("rates") or {}).get("RUB") if isinstance(payload, dict) else None
+        rate = float(rate)
+        if rate > 0:
+            logger.info("USD/RUB получен через open.er-api.com")
+            return rate
+    except Exception as exc:
+        logger.warning("Резервный источник USD/RUB недоступен: %s", exc)
     return None
 
 
-async def _fetch_coincap(client: httpx.AsyncClient, usd_rub: float) -> dict:
-    ids = ",".join(COINCAP_IDS.values())
-    response = await client.get(COINCAP_URL, params={"ids": ids})
-    response.raise_for_status()
-    payload = response.json()
-    items = payload.get("data", []) if isinstance(payload, dict) else []
-    reverse_ids = {asset_id: coin_id for coin_id, asset_id in COINCAP_IDS.items()}
+async def _fetch_coinpaprika(client: httpx.AsyncClient, usd_rub: float) -> dict:
+    """Получает USD-котировки из бесплатного публичного API CoinPaprika."""
+    payload = await _request_json(
+        client,
+        COINPAPRIKA_URL,
+        params={"quotes": "USD"},
+    )
+    if not isinstance(payload, list):
+        raise RuntimeError("CoinPaprika вернул неожиданный формат")
+
     result: dict[str, dict[str, float]] = {}
-    for item in items:
-        if not isinstance(item, dict):
+    # API обычно сортирует активы по rank; сохраняем первое совпадение тикера.
+    for item in sorted(
+        (x for x in payload if isinstance(x, dict)),
+        key=lambda x: int(x.get("rank") or 10**9),
+    ):
+        ticker = str(item.get("symbol") or "").upper()
+        coin_id = TICKER_TO_COIN_ID.get(ticker)
+        if not coin_id or coin_id in result:
             continue
-        coin_id = reverse_ids.get(str(item.get("id", "")))
+        quote = (item.get("quotes") or {}).get("USD") or {}
         try:
-            usd_price = float(item.get("priceUsd"))
+            usd_price = float(quote.get("price"))
         except (TypeError, ValueError):
             continue
-        if coin_id and usd_price > 0:
-            result[coin_id] = {
-                "usd": usd_price,
-                "rub": usd_price * usd_rub,
-            }
+        if usd_price > 0:
+            result[coin_id] = {"usd": usd_price, "rub": usd_price * usd_rub}
+
     if not result:
-        raise RuntimeError("CoinCap вернул пустой список котировок")
+        raise RuntimeError("CoinPaprika не вернул подходящих котировок")
     return result
 
 
+async def _fetch_coingecko(client: httpx.AsyncClient) -> dict:
+    payload = await _request_json(
+        client,
+        COINGECKO_URL,
+        params={"ids": ",".join(COINS), "vs_currencies": "rub,usd"},
+    )
+    if not isinstance(payload, dict) or not payload:
+        raise RuntimeError("CoinGecko вернул пустые данные")
+    return payload
+
+
 async def _fetch_rates() -> tuple[float, dict]:
+    """CoinGecko -> CoinPaprika; при сбое используем последний успешный кэш."""
     global _LAST_GOOD_RATES
 
+    timeout = httpx.Timeout(12.0, connect=5.0)
     async with httpx.AsyncClient(
-        timeout=httpx.Timeout(20.0, connect=8.0),
-        headers={"User-Agent": "TelegramCryptoRatesBot/1.2"},
+        timeout=timeout,
+        headers={"User-Agent": "TelegramCryptoRatesBot/2.0"},
+        follow_redirects=True,
     ) as client:
-        # ЦБ запрашиваем отдельно: его курс нужен и для резервного CoinCap.
         usd_rub = await _fetch_usd_rub(client)
 
         try:
-            crypto_response = await client.get(
-                COINGECKO_URL,
-                params={"ids": ",".join(COINS), "vs_currencies": "rub,usd"},
-            )
-            crypto_response.raise_for_status()
-            crypto_data = crypto_response.json()
-            if not isinstance(crypto_data, dict) or not crypto_data:
-                raise RuntimeError("CoinGecko вернул пустые данные")
+            crypto_data = await _fetch_coingecko(client)
             logger.info("Курсы криптовалют получены через CoinGecko")
         except Exception as primary_error:
-            logger.warning(
-                "CoinGecko недоступен (%s); переключаюсь на CoinCap",
-                primary_error,
-            )
+            logger.warning("CoinGecko недоступен: %s; пробую CoinPaprika", primary_error)
+            if not usd_rub and _LAST_GOOD_RATES:
+                usd_rub = _LAST_GOOD_RATES[0]
             if not usd_rub:
-                # Если ЦБ временно недоступен, используем сохранённый курс USD/RUB.
-                if _LAST_GOOD_RATES:
-                    usd_rub = _LAST_GOOD_RATES[0]
-                else:
-                    raise RuntimeError(
-                        "CoinGecko недоступен, а курс USD/RUB от ЦБ не получен"
-                    ) from primary_error
+                raise RuntimeError(
+                    "Не удалось получить USD/RUB ни от ЦБ, ни от open.er-api.com"
+                ) from primary_error
             try:
-                crypto_data = await _fetch_coincap(client, float(usd_rub))
-                logger.info("Курсы криптовалют получены через резервный CoinCap")
+                crypto_data = await _fetch_coinpaprika(client, float(usd_rub))
+                logger.info("Курсы криптовалют получены через CoinPaprika (бесплатный API)")
             except Exception as fallback_error:
-                logger.error("CoinCap тоже недоступен: %s", fallback_error)
+                logger.error("CoinPaprika тоже недоступен: %s", fallback_error)
                 if _LAST_GOOD_RATES:
-                    logger.warning("Использую последние успешно полученные курсы")
+                    logger.warning("Оба API недоступны; использую последние успешные курсы")
                     return _LAST_GOOD_RATES
                 raise RuntimeError(
-                    "CoinGecko и CoinCap недоступны, кэш ещё пуст"
+                    "CoinGecko и CoinPaprika недоступны, успешного кэша пока нет"
                 ) from fallback_error
 
     if not usd_rub:
@@ -210,13 +220,13 @@ async def _fetch_rates() -> tuple[float, dict]:
         if rub and usd:
             usd_rub = float(rub) / float(usd)
 
+    if not usd_rub and _LAST_GOOD_RATES:
+        usd_rub = _LAST_GOOD_RATES[0]
     if not usd_rub:
-        if _LAST_GOOD_RATES:
-            usd_rub = _LAST_GOOD_RATES[0]
-        else:
-            raise RuntimeError("Не удалось получить курс доллара к рублю")
+        raise RuntimeError("Не удалось определить курс USD/RUB")
 
-    # CoinCap отдаёт цены в USD — пересчитываем их в RUB по курсу ЦБ.
+    # CoinPaprika отдаёт USD; для него пересчёт в RUB уже сделан выше.
+    # CoinGecko обычно отдаёт обе валюты, но заполняем RUB, если её нет.
     for values in crypto_data.values():
         if isinstance(values, dict) and values.get("rub") is None and values.get("usd"):
             values["rub"] = float(values["usd"]) * float(usd_rub)
@@ -242,7 +252,7 @@ def _format_rates_text(usd_rub: float, data: dict) -> str:
 
     lines.extend([
         "",
-        "<i>Источники: CoinGecko / CoinCap и Банк России</i>",
+        "<i>Источники: CoinGecko / CoinPaprika, Банк России / open.er-api.com</i>",
         "⏰ Обновление ежедневно в 15:30 МСК",
         "Для отдельной монеты напиши: <code>Курс биткоин</code> или <code>Курс ETH</code>",
     ])
