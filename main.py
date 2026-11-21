@@ -49,6 +49,7 @@ import home_menu
 import secretsms
 import abrakadabra
 import my_article
+import crypto
 
 
 logging.basicConfig(
@@ -570,6 +571,7 @@ async def post_init(app: Application) -> None:
         )
 
         economy.register_jobs(app)
+        crypto.register_jobs(app)
         app.job_queue.run_repeating(premium.rewards_job, interval=3600, first=30)
 
     else:
@@ -738,6 +740,12 @@ def build_app() -> Application:
         )
     )
     app.add_handler(CommandHandler("restart", cmd_restart))
+    # Курсы валют и криптовалют: «Курс» / «Курс BTC» / «Курс биткоин».
+    app.add_handler(MessageHandler(
+        filters.Regex(r"(?i)^Курс(?:\s+.+)?$"),
+        crypto.cmd_rates,
+    ))
+
     app.add_handler(CommandHandler("casino", casino.cmd_casino))
     app.add_handler(
         CommandHandler("auraplush", aura_admin.cmd_aura_plush)
