@@ -72,7 +72,7 @@ async def _exec(
     sql: str,
     params: Optional[list] = None,
     retries: int = 2,
-) -> _EmptyResult:
+) -> Any:
     if _client is None:
         logger.error("db: _client не инициализирован (sql: %.80s)", sql)
         return _EmptyResult(error=True)
@@ -91,7 +91,7 @@ async def _exec(
             if params is None:
                 return await _client.execute(sql)
             return await _client.execute(sql, params)
-        except (KeyError, aiohttp.ClientError, asyncio.TimeoutError) as e:
+        except (aiohttp.ClientError, asyncio.TimeoutError) as e:
             last_exc = e
             if attempt < max_retries:
                 logger.warning(
@@ -101,7 +101,13 @@ async def _exec(
                 await asyncio.sleep(0.2 * (attempt + 1))
             continue
         except Exception as e:
-            logger.exception("db exec error (sql: %.80s): %s", sql, e)
+            # KeyError (в частности, KeyError('result')) не является
+            # сетевой ошибкой. Не скрываем traceback и не повторяем запрос:
+            # повтор INSERT/UPDATE может привести к двойному списанию/начислению.
+            logger.exception(
+                "db exec error [%s] (sql: %.120s): %s",
+                type(e).__name__, sql, e,
+            )
             return _EmptyResult(error=True)
 
     if last_exc is not None:
@@ -109,7 +115,7 @@ async def _exec(
     return _EmptyResult(error=True)
 
 
-async def _exec_required(sql: str, params: Optional[list] = None) -> _EmptyResult:
+async def _exec_required(sql: str, params: Optional[list] = None) -> Any:
     """Execute schema/migration SQL and stop startup if it fails."""
     result = await _exec(sql, params)
     if getattr(result, "error", False):
@@ -460,7 +466,8 @@ async def _create_tables() -> None:
             user_id        INTEGER NOT NULL,
             plan           TEXT NOT NULL,
             base_pocket_id INTEGER,
-            expires_at     TEXT NOT NULL
+            expires_at     TEXT NOT NULL,
+            last_reward_day TEXT
         )
     """)
     await _exec_required("""
@@ -511,6 +518,11 @@ async def _migrate_tables() -> None:
         ("coins", "reserve", "INTEGER NOT NULL DEFAULT 0"),
         ("coins", "circulating", "INTEGER NOT NULL DEFAULT 0"),
         ("coins", "dividend_pool", "INTEGER NOT NULL DEFAULT 0"),
+
+        # Premium: эти поля используются кодом покупки/ежедневной награды.
+        # Добавляются также в уже существующие базы без потери данных.
+        ("premium_subscriptions", "base_pocket_id", "INTEGER"),
+        ("premium_subscriptions", "last_reward_day", "TEXT"),
     ]
 
     existing: dict = {}
@@ -564,9 +576,7 @@ async def _migrate_tables() -> None:
         "ON bot_blacklist(username COLLATE NOCASE)",
     ]
     for sql in idx_stmts:
-        rs = await _exec_required(sql)
-        if getattr(rs, "error", False):
-            logger.warning("migrate: не удалось выполнить: %s", sql)
+        await _exec_required(sql)
 
     # Кредитные платежи и проценты зачисляются в казну триггерами в той же
     # SQL-операции, что и изменение долга. Это исключает рассинхронизацию
