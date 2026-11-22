@@ -463,7 +463,7 @@ async def _create_tables() -> None:
     await _exec_required("""
         CREATE TABLE IF NOT EXISTS premium_subscriptions (
             id             INTEGER PRIMARY KEY AUTOINCREMENT,
-            user_id        INTEGER NOT NULL,
+            user_id        INTEGER NOT NULL UNIQUE,
             plan           TEXT NOT NULL,
             base_pocket_id INTEGER,
             expires_at     TEXT NOT NULL,
@@ -534,6 +534,25 @@ async def _migrate_tables() -> None:
         if col in existing[table]:
             continue
         await _exec_required(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+
+    # Premium использует UPSERT ... ON CONFLICT(user_id).
+    # В старой схеме user_id не был UNIQUE (первичным ключом был id),
+    # поэтому libsql/Turso возвращал SQL-ошибку, а старый HTTP-клиент
+    # маскировал её как KeyError('result'). Сначала схлопываем возможные
+    # дубли, оставляя последнюю запись пользователя, затем создаём
+    # уникальный индекс, который обеспечивает корректный UPSERT.
+    await _exec_required("""
+        DELETE FROM premium_subscriptions
+        WHERE rowid NOT IN (
+            SELECT MAX(rowid)
+            FROM premium_subscriptions
+            GROUP BY user_id
+        )
+    """)
+    await _exec_required("""
+        CREATE UNIQUE INDEX IF NOT EXISTS uq_premium_subscriptions_user
+        ON premium_subscriptions(user_id)
+    """)
 
     idx_stmts = [
         "CREATE INDEX IF NOT EXISTS idx_marriages_chat_active "
